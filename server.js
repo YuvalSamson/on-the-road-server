@@ -132,7 +132,7 @@ You MUST follow these rules:
 
 // 5. Health check
 app.get("/health", (req, res) => {
-  res.json({ status: "ok" });
+  res.json({ status: "ok", build: "short-fact-v1" });
 });
 
 // 6. הרצה
@@ -140,3 +140,4 @@ const PORT = process.env.PORT || 3000;
 app.listen(PORT, "0.0.0.0", () => {
   console.log(`On The Road server listening on port ${PORT}`);
 });
+
