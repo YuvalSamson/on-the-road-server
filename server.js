@@ -1,9 +1,13 @@
-import "dotenv/config.js";
+// server.js
+
 import express from "express";
-import bodyParser from "body-parser";
 import cors from "cors";
+import bodyParser from "body-parser";
+import dotenv from "dotenv";
 import OpenAI from "openai";
 import fetch from "node-fetch";
+
+dotenv.config(); // טוען את .env
 
 const app = express();
 
@@ -19,11 +23,11 @@ const openai = new OpenAI({
 const ELEVENLABS_API_KEY = process.env.ELEVENLABS_API_KEY;
 
 if (!ELEVENLABS_API_KEY) {
-  console.error("Missing ELEVENLABS_API_KEY in .env");
+  console.error("Missing ELEVENLABS_API_KEY in environment");
   process.exit(1);
 }
 
-// טוענים את כל ה־VOICE_IDs מה־env
+// טוענים את כל ה-VOICE_IDs מה-env
 const VOICE_IDS = [];
 for (let i = 1; i <= 10; i++) {
   const id = process.env[`ELEVENLABS_VOICE_ID_${i}`];
@@ -33,7 +37,7 @@ for (let i = 1; i <= 10; i++) {
 }
 
 if (VOICE_IDS.length === 0) {
-  console.error("No ELEVENLABS_VOICE_ID_x defined in .env");
+  console.error("No ELEVENLABS_VOICE_ID_x defined in environment");
   process.exit(1);
 }
 
@@ -52,7 +56,7 @@ async function ttsWithElevenLabs(text) {
     headers: {
       "xi-api-key": ELEVENLABS_API_KEY,
       "Content-Type": "application/json",
-      "Accept": "audio/mpeg",
+      Accept: "audio/mpeg",
     },
     body: JSON.stringify({
       text,
@@ -115,7 +119,7 @@ app.post("/api/story-both", async (req, res) => {
   }
 });
 
-// 5. Health check פשוט
+// 5. Health check
 app.get("/health", (req, res) => {
   res.json({ status: "ok" });
 });
