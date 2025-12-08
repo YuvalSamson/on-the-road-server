@@ -83,10 +83,10 @@ async function ttsWithElevenLabs(text) {
   return { audioBase64, voiceId, voiceIndex: index, voiceKey };
 }
 
-// 4. /api/story-both - מקבל prompt, מחזיר טקסט + אודיו + מידע על הקול
+// 4. /api/story-both - מקבל prompt + lat/lng, מחזיר טקסט + אודיו + מידע על הקול
 app.post("/api/story-both", async (req, res) => {
   try {
-    const { prompt } = req.body;
+    const { prompt, lat, lng } = req.body;
 
     if (!prompt || typeof prompt !== "string") {
       return res
@@ -94,27 +94,37 @@ app.post("/api/story-both", async (req, res) => {
         .json({ error: "Missing 'prompt' in request body (string required)" });
     }
 
+    let locationLine = "Driver location is unknown.";
+    if (typeof lat === "number" && typeof lng === "number") {
+      locationLine = `Approximate driver location: latitude ${lat.toFixed(
+        4
+      )}, longitude ${lng.toFixed(4)}.`;
+    }
+
     const systemMessage = `
 You are the narrator of a driving app called "On The Road".
 
-You MUST follow these rules:
-- Length: 60 to 90 words, no more.
-- Tone: calm, clear, focused, suitable for a driver.
-- Content: include at least ONE concrete, verifiable fact (for example: a year, a historical event, a known person, or a clear geographic detail).
-- Use only facts that are widely known and easy to verify.
-- If you are not sure about a specific fact, DO NOT invent it. Say briefly that you are not sure about the exact details and stay general.
-- Do not invent legends, dialogues, or quotes.
-- No more than TWO factual details in total.
-- Keep it short, simple and grounded in reality.
+Hard rules:
+- Length: 80 to 130 words.
+- Start immediately with something interesting about the place or region - no greetings, no small talk.
+- Use the given location as a hint: talk about the nearby area, or if unsure, about the wider region (for example: central Israel, the Mediterranean coast, or Israel in general).
+- Include 3 to 5 concrete, widely known facts (dates, historical events, famous people, landmarks, or clear geographic features).
+- Prefer to give a bit more detail on one or two "golden facts" instead of vague generalities.
+- If you are not sure about local details, clearly say you are speaking about the broader region and use only safe, well-known facts.
+- Do not invent legends, quotes, or hyper-specific anecdotes.
+- No lists or bullet points - one flowing paragraph, short and focused.
 `;
+
+    const userMessage = `${locationLine}
+User request: ${prompt}`;
 
     const completion = await openai.chat.completions.create({
       model: "gpt-4.1-mini",
       messages: [
         { role: "system", content: systemMessage },
-        { role: "user", content: prompt },
+        { role: "user", content: userMessage },
       ],
-      temperature: 0.3, // פחות יצירתי, יותר צמוד לעובדות
+      temperature: 0.35,
     });
 
     const storyText = completion.choices[0]?.message?.content?.trim();
@@ -140,7 +150,7 @@ You MUST follow these rules:
 
 // 5. Health check
 app.get("/health", (req, res) => {
-  res.json({ status: "ok", build: "short-fact-v1" });
+  res.json({ status: "ok", build: "short-fact-v2" });
 });
 
 // 6. הרצה
