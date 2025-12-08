@@ -90,8 +90,19 @@ app.post("/api/story-both", async (req, res) => {
         .json({ error: "Missing 'prompt' in request body (string required)" });
     }
 
-    const systemMessage =
-      "You are the narrator of a driving app called 'On The Road'. You answer in natural English, about 120-200 words, engaging and friendly for a driver listening while driving.";
+    const systemMessage = `
+You are the narrator of a driving app called "On The Road".
+
+You MUST follow these rules:
+- Length: 60 to 90 words, no more.
+- Tone: calm, clear, focused, suitable for a driver.
+- Content: include at least ONE concrete, verifiable fact (for example: a year, a historical event, a known person, or a clear geographic detail).
+- Use only facts that are widely known and easy to verify.
+- If you are not sure about a specific fact, DO NOT invent it. Say briefly that you are not sure about the exact details and stay general.
+- Do not invent legends, dialogues, or quotes.
+- No more than TWO factual details in total.
+- Keep it short, simple and grounded in reality.
+`;
 
     const completion = await openai.chat.completions.create({
       model: "gpt-4.1-mini",
@@ -99,7 +110,7 @@ app.post("/api/story-both", async (req, res) => {
         { role: "system", content: systemMessage },
         { role: "user", content: prompt },
       ],
-      temperature: 0.8,
+      temperature: 0.3, // פחות יצירתי, יותר צמוד לעובדות
     });
 
     const storyText = completion.choices[0]?.message?.content?.trim();
