@@ -229,6 +229,7 @@ Règles strictes:
 // 8. /api/story-both - מקבל prompt + lat/lng + language, מחזיר טקסט + אודיו + מידע על הקול
 app.post("/api/story-both", async (req, res) => {
   try {
+    console.log("BODY FROM CLIENT:", req.body);
     const { prompt, lat, lng } = req.body;
     let { language } = req.body;
 
@@ -330,3 +331,4 @@ const PORT = process.env.PORT || 3000;
 app.listen(PORT, "0.0.0.0", () => {
   console.log(`On The Road server listening on port ${PORT}`);
 });
+
