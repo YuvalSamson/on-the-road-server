@@ -21,7 +21,7 @@ if (!DATABASE_URL) {
   console.warn("⚠️ DATABASE_URL is missing - using in memory only, no persistent DB");
 }
 
-// Pool ל Postgres אם יש DATABASE_URL
+// Pool ל-Postgres אם יש DATABASE_URL
 let pool = null;
 if (DATABASE_URL) {
   pool = new Pool({ connectionString: DATABASE_URL });
@@ -32,13 +32,13 @@ const app = express();
 app.use(cors());
 app.use(bodyParser.json());
 
-// 1. OpenAI client - גם לטקסט וגם ל TTS
+// 1. OpenAI client - גם לטקסט וגם ל-TTS
 const openai = new OpenAI({
   apiKey: process.env.OPENAI_API_KEY,
 });
 
 // 2. קולות TTS
-// בעברית - תמיד nova
+// בעברית - תמיד nova, בשאר שפות רנדומלי מתוך כמה קולות
 const TTS_VOICES_NON_HE = ["alloy", "fable", "shimmer"];
 
 function pickVoice(language) {
@@ -86,14 +86,14 @@ async function ttsWithOpenAI(text, language = "he") {
 
 /**
  * ===== "דאטאבייס" + cache =====
- * 1. places_cache - נשמר ב Postgres, בנוסף ל cache בזיכרון
- * 2. user_place_history - מקומות שיוזר כבר שמע עליהם
+ * 1. places_cache - נשמר ב-Postgres, בנוסף ל-cache בזיכרון
+ * 2. user_place_history - היסטוריית מקומות ברמת יוזר
  */
 
 // cache בזיכרון לתוצאות Google Places
 const placesCacheMemory = new Map(); // key: "lat,lng,radius" => value: places[]
 
-// cache בזיכרון להיסטוריית מקומות של יוזר
+// cache בזיכרון להיסטוריית מקומות פר-יוזר
 const userPlacesHistoryMemory = new Map(); // key: userKey => Set(placeId)
 
 function makePlacesCacheKey(lat, lng, radiusMeters) {
@@ -132,19 +132,25 @@ async function initDb() {
   }
 }
 
-// helper ל user key
+// הפקת מזהה יוזר מהבקשה:
+// 1. אם יש header בשם x-user-id - משתמשים בו (עדיף, יציב אמיתי)
+// 2. אחרת IP / fallback ל-anon
 function getUserKeyFromRequest(req) {
   const headerId = req.headers["x-user-id"];
   if (typeof headerId === "string" && headerId.trim() !== "") {
     return `user:${headerId.trim()}`;
   }
-  const ip =
-    (typeof req.ip === "string" && req.ip) ||
-    (typeof req.headers["x-forwarded-for"] === "string" &&
-      req.headers["x-forwarded-for"]);
+
+  const ipHeader = req.headers["x-forwarded-for"];
+  if (typeof ipHeader === "string" && ipHeader.trim() !== "") {
+    return `ip:${ipHeader.split(",")[0].trim()}`;
+  }
+
+  const ip = typeof req.ip === "string" && req.ip ? req.ip : null;
   if (ip) {
     return `ip:${ip}`;
   }
+
   return "anon";
 }
 
@@ -196,7 +202,7 @@ async function markPlaceHeardForUser(userKey, placeId) {
   }
 }
 
-// 4. Google Places - קריאה אמיתית ל Google
+// 4. Google Places - קריאה אמיתית ל-Google
 async function fetchNearbyPlacesFromGoogle(lat, lng, radiusMeters = 800) {
   if (!GOOGLE_PLACES_API_KEY) {
     throw new Error("GOOGLE_PLACES_API_KEY is not configured");
@@ -316,8 +322,8 @@ function distanceMeters(lat1, lng1, lat2, lng2) {
 
 /**
  * בחירת מקום "מועדף" ליוזר:
- * - מחזיר רק מקום שהיוזר עדיין לא שמע עליו
- * - אם כל המקומות כבר נשמעו - מחזיר null (כדי לא לחזור על אותו מקום)
+ * - מחזיר רק מקום שהיוזר הזה עדיין לא שמע עליו
+ * - אם כל המקומות כבר נשמעו אצל היוזר הזה - מחזיר null
  */
 async function pickBestPlaceForUser(places, lat, lng, userKey) {
   if (!places || places.length === 0) return null;
@@ -347,7 +353,7 @@ async function pickBestPlaceForUser(places, lat, lng, userKey) {
     };
   }
 
-  // אין מקום חדש - לא נבחר שום POI כדי לא לחזור על אותו מקום שוב ושוב
+  // אין מקום חדש ליוזר הזה - לא בוחרים POI כדי לא לחזור על אותו מקום
   return null;
 }
 
@@ -511,7 +517,7 @@ app.post("/api/story-both", async (req, res) => {
       )}, longitude ${lng.toFixed(4)}.`;
 
       try {
-        // מחפשים מקום חדש בטווחים הולכים וגדלים: 400, 800, 1500 מטר
+        // מחפשים מקום חדש ליוזר בטווחים הולכים וגדלים: 400, 800, 1500 מטר
         let bestInfo = null;
 
         const places400 = await getNearbyPlaces(lat, lng, 400);
@@ -589,7 +595,7 @@ ${poiLine ? poiLine + "\n" : ""}User request: ${prompt}`;
 app.get("/health", (req, res) => {
   res.json({
     status: "ok",
-    build: "golden-fact-multi-lang-nearby-juicy-name-he-nova-db-v2-norepeat",
+    build: "golden-fact-multi-lang-nearby-juicy-name-he-nova-db-v4-per-user",
   });
 });
 
