@@ -24,12 +24,22 @@ const openai = new OpenAI({
   apiKey: process.env.OPENAI_API_KEY,
 });
 
-// 2. קולות TTS של OpenAI - קולות יותר "חיים"
-const TTS_VOICES = ["alloy", "nova", "fable", "shimmer"];
+// 2. קולות TTS של OpenAI
+// בעברית - נשתמש תמיד ב nova
+const TTS_VOICES_NON_HE = ["alloy", "fable", "shimmer"];
 
-function pickRandomVoice() {
-  const idx = Math.floor(Math.random() * TTS_VOICES.length);
-  const voiceName = TTS_VOICES[idx];
+function pickVoice(language) {
+  // אם השפה עברית - תמיד nova
+  if (language === "he") {
+    const voiceName = "nova";
+    const voiceIndex = 1;
+    const voiceKey = "OPENAI_VOICE_NOVA";
+    return { voiceName, voiceIndex, voiceKey };
+  }
+
+  // בשאר השפות - רנדומלי מתוך הרשימה
+  const idx = Math.floor(Math.random() * TTS_VOICES_NON_HE.length);
+  const voiceName = TTS_VOICES_NON_HE[idx];
   const voiceIndex = idx + 1;
   const voiceKey = `OPENAI_VOICE_${voiceName.toUpperCase()}`;
   return { voiceName, voiceIndex, voiceKey };
@@ -37,7 +47,7 @@ function pickRandomVoice() {
 
 // 3. TTS בעזרת OpenAI - מחזיר base64 + מידע על הקול, עם הוראות אינטונציה
 async function ttsWithOpenAI(text, language = "he") {
-  const { voiceName, voiceIndex, voiceKey } = pickRandomVoice();
+  const { voiceName, voiceIndex, voiceKey } = pickVoice(language);
 
   const instructions =
     "Speak in the same language as the input text with a very natural, lively storyteller style. " +
@@ -67,6 +77,7 @@ async function ttsWithOpenAI(text, language = "he") {
  * ===== "דאטאבייס" פשוט בזיכרון =====
  * 1. placesCache - cache של תוצאות Google Places לפי קואורדינטות+רדיוס
  * 2. userPlacesHistory - היסטוריית מקומות של כל יוזר, כדי לא לחזור על אותו POI
+ *    כל זה עדיין בזיכרון בלבד (in-memory) ולכן מתאפס בדיפלוי. על זה נדבר עוד רגע.
  */
 
 // cache לתוצאות Google Places
@@ -363,7 +374,7 @@ Règles strictes:
 - אפשר להוסיף עוד פרט אחד או שניים רק אם הם מחזקים ישירות את אותה עובדה. לא להתפזר לנושאים אחרים.
 - להימנע ממשפטי תיירות כלליים כמו "זו עיר תוססת ומלאת חיים". תעדיף פרטים קונקרטיים, תאריכים, אנשים, מבנים או אירועים, במיוחד כאלה שיש בהם קונפליקט, החלטה אמיצה או מחיר אישי.
 - אסור לך לסיים במשפט סיכום כללי או סתמי, כמו "אז בפעם הבאה שתעברו כאן...", "אז כן, זה המקום", "בקיצור" או כל משפט שמסכם או מדבר על מה שסיפרת עכשיו.
-- המשפט האחרון שלך חייב להכיל פרט קונקרטי או פאנץ' קטן על המקום עצמו או על האדם שהשם מנציח – לא מחשבה כללית, לא סיכום, ולא המלצה לעתיד.
+- המשפט האחרון שלך חייב להכיל פרט קונקרטי או פאנץ' קטן על המקום עצמו או על האדם שהשם מנציח - לא מחשבה כללית, לא סיכום, ולא המלצה לעתיד.
 - פסקה אחת קצרה וזורמת, בלי נקודות רשימה, באורך בערך 40 עד 70 מילים.
 `;
   }
@@ -466,7 +477,7 @@ ${poiLine ? poiLine + "\n" : ""}User request: ${prompt}`;
 app.get("/health", (req, res) => {
   res.json({
     status: "ok",
-    build: "golden-fact-multi-lang-nearby-juicy-name-v1",
+    build: "golden-fact-multi-lang-nearby-juicy-name-he-nova-v1",
   });
 });
 
