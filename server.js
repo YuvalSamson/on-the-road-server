@@ -8,6 +8,12 @@ import OpenAI from "openai";
 
 dotenv.config(); // טוען את .env
 
+const GOOGLE_PLACES_API_KEY = process.env.GOOGLE_PLACES_API_KEY;
+
+if (!GOOGLE_PLACES_API_KEY) {
+  console.warn("⚠️ GOOGLE_PLACES_API_KEY is missing in .env");
+}
+
 const app = express();
 
 app.use(cors());
@@ -141,3 +147,4 @@ const PORT = process.env.PORT || 3000;
 app.listen(PORT, "0.0.0.0", () => {
   console.log(`On The Road server listening on port ${PORT}`);
 });
+
