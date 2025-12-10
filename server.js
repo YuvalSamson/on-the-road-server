@@ -66,7 +66,7 @@ async function ttsWithOpenAI(text) {
 }
 
 // 4. Google Places - פונקציה שמביאה נקודות עניין קרובות
-async function getNearbyPlaces(lat, lng, radiusMeters = 800, includedTypes = []) {
+async function getNearbyPlaces(lat, lng, radiusMeters = 800) {
   if (!GOOGLE_PLACES_API_KEY) {
     throw new Error("GOOGLE_PLACES_API_KEY is not configured");
   }
@@ -84,23 +84,8 @@ async function getNearbyPlaces(lat, lng, radiusMeters = 800, includedTypes = [])
       },
     },
     maxResultCount: 10,
+    // לא שולחים includedTypes בכלל כדי להימנע משגיאות של Unsupported types
   };
-
-  if (includedTypes && includedTypes.length > 0) {
-    body.includedTypes = includedTypes;
-  } else {
-    // חשוב - בלי point_of_interest כי Places API (New) לא תומך בזה כחלק מ-includedTypes
-    body.includedTypes = [
-      "tourist_attraction",
-      "museum",
-      "park",
-      "church",
-      "synagogue",
-      "hindu_temple",
-      "mosque",
-      "city_hall",
-    ];
-  }
 
   const resp = await fetch(url, {
     method: "POST",
@@ -137,7 +122,7 @@ async function getNearbyPlaces(lat, lng, radiusMeters = 800, includedTypes = [])
 // 5. /places - מחזיר מקומות קרובים לפי lat/lng
 app.get("/places", async (req, res) => {
   try {
-    const { lat, lng, radius, types } = req.query;
+    const { lat, lng, radius } = req.query;
 
     if (!lat || !lng) {
       return res
@@ -147,19 +132,10 @@ app.get("/places", async (req, res) => {
 
     const radiusMeters = radius ? Number(radius) : 800;
 
-    let includedTypes = [];
-    if (types) {
-      includedTypes = String(types)
-        .split(",")
-        .map((t) => t.trim())
-        .filter(Boolean);
-    }
-
     const places = await getNearbyPlaces(
       Number(lat),
       Number(lng),
-      radiusMeters,
-      includedTypes
+      radiusMeters
     );
 
     res.json({ places });
