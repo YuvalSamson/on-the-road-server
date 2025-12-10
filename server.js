@@ -5,17 +5,30 @@ import cors from "cors";
 import bodyParser from "body-parser";
 import dotenv from "dotenv";
 import OpenAI from "openai";
+import pkg from "pg";
+
+const { Pool } = pkg;
 
 dotenv.config(); // טוען את .env
 
 const GOOGLE_PLACES_API_KEY = process.env.GOOGLE_PLACES_API_KEY;
+const DATABASE_URL = process.env.DATABASE_URL;
 
 if (!GOOGLE_PLACES_API_KEY) {
   console.warn("⚠️ GOOGLE_PLACES_API_KEY is missing in .env");
 }
+if (!DATABASE_URL) {
+  console.warn("⚠️ DATABASE_URL is missing - using in memory only, no persistent DB");
+}
 
+// Pool ל Postgres אם יש DATABASE_URL
+let pool = null;
+if (DATABASE_URL) {
+  pool = new Pool({ connectionString: DATABASE_URL });
+}
+
+// אפליקציה
 const app = express();
-
 app.use(cors());
 app.use(bodyParser.json());
 
@@ -25,11 +38,10 @@ const openai = new OpenAI({
 });
 
 // 2. קולות TTS של OpenAI
-// בעברית - נשתמש תמיד ב nova
+// בעברית - תמיד nova
 const TTS_VOICES_NON_HE = ["alloy", "fable", "shimmer"];
 
 function pickVoice(language) {
-  // אם השפה עברית - תמיד nova
   if (language === "he") {
     const voiceName = "nova";
     const voiceIndex = 1;
@@ -37,7 +49,6 @@ function pickVoice(language) {
     return { voiceName, voiceIndex, voiceKey };
   }
 
-  // בשאר השפות - רנדומלי מתוך הרשימה
   const idx = Math.floor(Math.random() * TTS_VOICES_NON_HE.length);
   const voiceName = TTS_VOICES_NON_HE[idx];
   const voiceIndex = idx + 1;
@@ -74,25 +85,54 @@ async function ttsWithOpenAI(text, language = "he") {
 }
 
 /**
- * ===== "דאטאבייס" פשוט בזיכרון =====
- * 1. placesCache - cache של תוצאות Google Places לפי קואורדינטות+רדיוס
- * 2. userPlacesHistory - היסטוריית מקומות של כל יוזר, כדי לא לחזור על אותו POI
- *    כל זה עדיין בזיכרון בלבד (in-memory) ולכן מתאפס בדיפלוי. על זה נדבר עוד רגע.
+ * ===== "דאטאבייס" + cache =====
+ * 1. places_cache - נשמר ב Postgres, בנוסף ל cache בזיכרון
+ * 2. user_place_history - מקומות שיוזר כבר שמע עליהם
  */
 
-// cache לתוצאות Google Places
-const placesCache = new Map(); // key: "lat,lng,radius" => value: places[]
+// cache בזיכרון לתוצאות Google Places
+const placesCacheMemory = new Map(); // key: "lat,lng,radius" => value: places[]
+
+// cache בזיכרון להיסטוריית מקומות של יוזר
+const userPlacesHistoryMemory = new Map(); // key: userKey => Set(placeId)
 
 function makePlacesCacheKey(lat, lng, radiusMeters) {
-  const latKey = lat.toFixed(4); // קירוב
+  const latKey = lat.toFixed(4);
   const lngKey = lng.toFixed(4);
   return `${latKey},${lngKey},${radiusMeters}`;
 }
 
-// היסטוריית מקומות לכל יוזר
-// key: userKey (x-user-id או ip) => Set(placeId)
-const userPlacesHistory = new Map();
+// אתחול DB - יצירת טבלאות אם צריך
+async function initDb() {
+  if (!pool) {
+    console.warn("DB init skipped - no DATABASE_URL");
+    return;
+  }
+  try {
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS places_cache (
+        cache_key   text PRIMARY KEY,
+        places_json jsonb NOT NULL,
+        updated_at  timestamptz NOT NULL DEFAULT now()
+      );
+    `);
 
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS user_place_history (
+        user_key      text NOT NULL,
+        place_id      text NOT NULL,
+        first_seen_at timestamptz NOT NULL DEFAULT now(),
+        PRIMARY KEY (user_key, place_id)
+      );
+    `);
+
+    console.log("✅ DB tables ready");
+  } catch (err) {
+    console.error("❌ Error initializing DB:", err);
+  }
+}
+
+// helper ל user key
 function getUserKeyFromRequest(req) {
   const headerId = req.headers["x-user-id"];
   if (typeof headerId === "string" && headerId.trim() !== "") {
@@ -108,17 +148,55 @@ function getUserKeyFromRequest(req) {
   return "anon";
 }
 
-function markPlaceHeardForUser(userKey, placeId) {
-  if (!placeId) return;
-  let set = userPlacesHistory.get(userKey);
-  if (!set) {
-    set = new Set();
-    userPlacesHistory.set(userKey, set);
+// החזרת Set של place_id שיוזר כבר שמע
+async function getHeardSetForUser(userKey) {
+  let set = userPlacesHistoryMemory.get(userKey);
+  if (set) return set;
+
+  set = new Set();
+
+  if (pool) {
+    try {
+      const { rows } = await pool.query(
+        "SELECT place_id FROM user_place_history WHERE user_key = $1",
+        [userKey]
+      );
+      for (const row of rows) {
+        set.add(row.place_id);
+      }
+    } catch (err) {
+      console.error("DB error in getHeardSetForUser:", err);
+    }
   }
-  set.add(placeId);
+
+  userPlacesHistoryMemory.set(userKey, set);
+  return set;
 }
 
-// 4. Google Places - קריאה אמיתית ל-Google
+// סימון מקום כיוזר כבר שמע עליו
+async function markPlaceHeardForUser(userKey, placeId) {
+  if (!placeId) return;
+
+  const set = await getHeardSetForUser(userKey);
+  set.add(placeId);
+
+  if (!pool) return;
+
+  try {
+    await pool.query(
+      `
+      INSERT INTO user_place_history (user_key, place_id)
+      VALUES ($1, $2)
+      ON CONFLICT (user_key, place_id) DO NOTHING
+    `,
+      [userKey, placeId]
+    );
+  } catch (err) {
+    console.error("DB error in markPlaceHeardForUser:", err);
+  }
+}
+
+// 4. Google Places - קריאה אמיתית ל Google
 async function fetchNearbyPlacesFromGoogle(lat, lng, radiusMeters = 800) {
   if (!GOOGLE_PLACES_API_KEY) {
     throw new Error("GOOGLE_PLACES_API_KEY is not configured");
@@ -171,15 +249,49 @@ async function fetchNearbyPlacesFromGoogle(lat, lng, radiusMeters = 800) {
   return places;
 }
 
-// עטיפת cache
+// עטיפת cache - קודם memory, אח"כ DB, ואם אין אז Google
 async function getNearbyPlaces(lat, lng, radiusMeters = 800) {
   const key = makePlacesCacheKey(lat, lng, radiusMeters);
-  const cached = placesCache.get(key);
-  if (cached) {
-    return cached;
+
+  const mem = placesCacheMemory.get(key);
+  if (mem) return mem;
+
+  if (pool) {
+    try {
+      const { rows } = await pool.query(
+        "SELECT places_json FROM places_cache WHERE cache_key = $1",
+        [key]
+      );
+      if (rows.length > 0) {
+        const places = rows[0].places_json;
+        placesCacheMemory.set(key, places);
+        return places;
+      }
+    } catch (err) {
+      console.error("DB error in getNearbyPlaces (select):", err);
+    }
   }
+
   const fresh = await fetchNearbyPlacesFromGoogle(lat, lng, radiusMeters);
-  placesCache.set(key, fresh);
+
+  placesCacheMemory.set(key, fresh);
+
+  if (pool) {
+    try {
+      await pool.query(
+        `
+        INSERT INTO places_cache (cache_key, places_json, updated_at)
+        VALUES ($1, $2, now())
+        ON CONFLICT (cache_key)
+        DO UPDATE SET places_json = EXCLUDED.places_json, updated_at = now()
+      `,
+        [key, JSON.stringify(fresh)]
+      );
+    } catch (err) {
+      console.error("DB error in getNearbyPlaces (upsert):", err);
+    }
+  }
+
   return fresh;
 }
 
@@ -208,10 +320,10 @@ function distanceMeters(lat1, lng1, lat2, lng2) {
  * - מבין החדשים: הקרוב ביותר
  * - אם אין חדש: הקרוב ביותר בכלל
  */
-function pickBestPlaceForUser(places, lat, lng, userKey) {
+async function pickBestPlaceForUser(places, lat, lng, userKey) {
   if (!places || places.length === 0) return null;
 
-  const heardSet = userPlacesHistory.get(userKey) || new Set();
+  const heardSet = await getHeardSetForUser(userKey);
 
   let bestNew = null;
   let bestNewDist = null;
@@ -412,11 +524,21 @@ app.post("/api/story-both", async (req, res) => {
 
       try {
         const places400 = await getNearbyPlaces(lat, lng, 400);
-        let bestInfo = pickBestPlaceForUser(places400, lat, lng, userKey);
+        let bestInfo = await pickBestPlaceForUser(
+          places400,
+          lat,
+          lng,
+          userKey
+        );
 
         if (!bestInfo || !bestInfo.isNew) {
           const places800 = await getNearbyPlaces(lat, lng, 800);
-          const from800 = pickBestPlaceForUser(places800, lat, lng, userKey);
+          const from800 = await pickBestPlaceForUser(
+            places800,
+            lat,
+            lng,
+            userKey
+          );
 
           if (from800 && from800.isNew) {
             bestInfo = from800;
@@ -430,7 +552,7 @@ app.post("/api/story-both", async (req, res) => {
           const distRounded = Math.round(bestInfo.distanceMeters ?? 0);
           poiLine = `Nearby point of interest (distance about ${distRounded} meters): "${best.name}", address: ${best.address}. Use this specific place and especially its name as the main focus of the story.`;
 
-          markPlaceHeardForUser(userKey, best.id);
+          await markPlaceHeardForUser(userKey, best.id);
         }
       } catch (e) {
         console.error("Failed to fetch places for story-both:", e);
@@ -477,11 +599,15 @@ ${poiLine ? poiLine + "\n" : ""}User request: ${prompt}`;
 app.get("/health", (req, res) => {
   res.json({
     status: "ok",
-    build: "golden-fact-multi-lang-nearby-juicy-name-he-nova-v1",
+    build: "golden-fact-multi-lang-nearby-juicy-name-he-nova-db-v1",
   });
 });
 
-// 10. הרצה
+// 10. אתחול DB והרצה
+initDb().catch((err) => {
+  console.error("DB init failed:", err);
+});
+
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, "0.0.0.0", () => {
   console.log(`On The Road server listening on port ${PORT}`);
