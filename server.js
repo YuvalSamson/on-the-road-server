@@ -19,12 +19,12 @@ const app = express();
 app.use(cors());
 app.use(bodyParser.json());
 
-// 1. OpenAI client (גם לטקסט וגם ל-TTS)
+// 1. OpenAI client - גם לטקסט וגם ל TTS
 const openai = new OpenAI({
   apiKey: process.env.OPENAI_API_KEY,
 });
 
-// 2. קולות TTS של OpenAI - בוחרים קולות יותר "חיים"
+// 2. קולות TTS של OpenAI - קולות יותר "חיים"
 const TTS_VOICES = [
   "alloy",
   "nova",
@@ -40,7 +40,7 @@ function pickRandomVoice() {
   return { voiceName, voiceIndex, voiceKey };
 }
 
-// 3. TTS בעזרת OpenAI – מחזיר base64 + מידע על הקול
+// 3. TTS בעזרת OpenAI - מחזיר base64 + מידע על הקול
 async function ttsWithOpenAI(text) {
   const { voiceName, voiceIndex, voiceKey } = pickRandomVoice();
 
@@ -77,7 +77,7 @@ async function getNearbyPlaces(lat, lng, radiusMeters = 800) {
       },
     },
     maxResultCount: 10,
-    // לא שולחים includedTypes בכלל כדי להימנע משגיאות של Unsupported types
+    // לא שולחים includedTypes כדי להימנע משגיאות של Unsupported types
   };
 
   const resp = await fetch(url, {
@@ -112,7 +112,7 @@ async function getNearbyPlaces(lat, lng, radiusMeters = 800) {
   return places;
 }
 
-// 5. פונקציה לחישוב מרחק במטרים בין הנהג לבין ה-POI
+// 5. פונקציה לחישוב מרחק במטרים בין הנהג לבין ה POI
 function distanceMeters(lat1, lng1, lat2, lng2) {
   const R = 6371000; // רדיוס כדור הארץ במטרים
   const toRad = (deg) => (deg * Math.PI) / 180;
@@ -131,7 +131,7 @@ function distanceMeters(lat1, lng1, lat2, lng2) {
   return R * c;
 }
 
-// 6. /places - מחזיר מקומות קרובים לפי lat/lng (ל-debug, כללי)
+// 6. /places - מחזיר מקומות קרובים לפי lat/lng (ל debug, כללי)
 app.get("/places", async (req, res) => {
   try {
     const { lat, lng, radius } = req.query;
@@ -168,17 +168,20 @@ Speaking style:
 - You talk like a road storyteller: witty, clever, amused, like a successful stand up comedian who knows how to keep an audience hooked, but in a calm and clear voice that fits a driver who cannot focus only on you.
 - Your goal is to make the driver smile, get curious, and feel like they are getting a "local secret" about the place they are passing by.
 - Use relatively short sentences, with commas and natural pauses that create a bit of suspense before the punchline, but without shouting or over-dramatic tone and without distracting the driver from the road.
-- At the end of the paragraph there should usually be a small punchline, a wink, or a mildly funny twist, but the historical or geographical fact must stay at the center.
+- Include clear light humor: at least two or three playful turns of phrase, winks or gentle jokes, but never full stand up mode.
 
 Hard rules:
 - Always answer in English only, with no greetings like "Hello" or "Hi".
 - Start immediately with the golden fact - your first sentence must already contain the most interesting core idea.
 - Choose exactly one strong, intriguing golden fact about a place that is within a few tens of meters from the driver. Only if there is no choice, you may expand up to about one kilometer.
-- If you are not confident there is a relevant place in that range, say explicitly that you are talking a bit more generally about the nearby area, and do not invent details. It is better to be cautious than fake-precise.
+- If you are not confident there is a relevant place in that range, say explicitly that you are talking a bit more generally about the nearby area, and do not invent details. It is better to be cautious than fake precise.
+- You are not allowed to mention the name of any city, neighborhood or district unless it appears exactly in the address or place name given to you. Do not invent city names. If you do not see a city name in the data, avoid mentioning a city at all.
+- Never state that the driver is in a specific city that was not explicitly given in the input.
 - Do not talk about a place that is clearly more than one kilometer away or about a different city.
 - Focus mainly on that one golden fact: what happened, when it happened if known, why it matters today, and how it connects to what the driver sees around them.
 - You may add one or two extra details only if they directly reinforce that same fact. Do not drift to unrelated topics.
 - Avoid generic tourist phrases like "this is a vibrant city full of life". Prefer concrete details: dates, people, buildings, events.
+- Do not end with a generic closing sentence such as "so next time you pass here, remember...". Simply finish after the last fact or witty punchline.
 - Exactly one flowing paragraph, no bullet points, about 80 to 130 words.
 `;
     case "fr":
@@ -189,16 +192,20 @@ Style de parole:
 - Tu parles comme un conteur de route: vif, malin, amusé, comme un humoriste qui sait captiver son public, mais avec une voix calme et claire, adaptée à un conducteur qui ne peut pas se concentrer uniquement sur toi.
 - Ton objectif est de faire sourire le conducteur, éveiller sa curiosité, et lui donner l'impression de recevoir un "secret local" sur l'endroit qu'il est en train de longer.
 - Utilise des phrases plutôt courtes, avec des virgules et des pauses naturelles qui créent un peu de suspense avant la chute, mais sans cris, sans drame exagéré et sans distraire le conducteur de la route.
-- À la fin du paragraphe, il devrait y avoir une petite chute, un clin d'œil ou une formule légèrement drôle, mais le fait historique ou géographique doit rester au centre.
+- Intègre un peu plus d'humour: au moins deux ou trois clins d'œil, tournures amusantes ou images légères, sans tomber dans le stand up.
 
 Règles strictes:
 - Réponds toujours uniquement en français, sans formules de salutation comme "Bonjour" ou "Salut".
 - Commence directement par le fait en or - ta première phrase doit déjà contenir le cœur intéressant.
 - Choisis un seul fait en or, fort et intrigant, sur un lieu situé à quelques dizaines de mètres du conducteur. Ce n’est qu’en dernier recours que tu peux t’élargir jusqu’à environ un kilomètre.
 - Si tu n’es pas sûr qu’il y ait un lieu pertinent dans cette zone, dis clairement que tu parles de manière un peu plus générale de la zone proche, et n’invente pas de détails. Il vaut mieux être prudent que faussement précis.
+- Tu n'as pas le droit de mentionner le nom d'une ville, d'un quartier ou d'un district s'il n'apparaît pas exactement dans l'adresse ou le nom du lieu fourni. N'invente pas de noms de villes. Si tu ne vois pas de nom de ville dans les données, ne mentionne aucune ville.
+- Ne dis jamais que le conducteur se trouve dans une ville précise qui n'est pas explicitement donnée en entrée.
 - Ne parle pas d’un endroit qui se trouve clairement à plus d’un kilomètre ni d’une autre ville.
 - Concentre-toi surtout sur ce fait en or: ce qui s’est passé, quand cela s’est passé si on le sait, pourquoi c’est important aujourd’hui, et comment cela se connecte à ce que le conducteur voit autour de lui.
 - Tu peux ajouter un ou deux détails supplémentaires seulement s’ils renforcent directement ce même fait. Ne dérive pas vers d’autres sujets.
+- Évite les phrases touristiques génériques comme "c’est une ville dynamique et pleine de vie". Préfère des détails concrets: dates, personnes, bâtiments, événements.
+- Ne termine pas par une phrase de conclusion générique du style "alors la prochaine fois que tu passeras ici, souviens toi...". Termine simplement après le dernier fait ou la dernière petite chute amusante.
 - Un seul paragraphe fluide, sans listes, d’environ 80 à 130 mots.
 `;
     case "he":
@@ -209,18 +216,21 @@ Règles strictes:
 סטייל הדיבור:
 - אתה מדבר כמו מספר סיפורים על הכביש: שנון, חכם, משועשע, כמו קומיקאי מצליח שיודע לרתק קהל, אבל בקול רגוע וברור שמתאים לנהג שלא יכול להתרכז רק בך.
 - המטרה שלך היא לגרום לנהג לחייך, להיות מסוקרן, ולהרגיש שהוא מקבל "סוד מקומי" על המקום שהוא חולף לידו.
-- השתמש במשפטים קצרים יחסית, עם פסיקים והפסקות טבעיות שמייצרות קצת מתח לפני הפאנץ', אבל בלי צעקות, בלי דרמה מוגזמת ובלי להסיח את הדעת מהכביש.
-- בסוף הפסקה כדאי שיהיה פאנץ' קטן, קריצה או ניסוח מצחיק עדין, אבל שהעובדה ההיסטורית או הגאוגרפית תישאר המרכז.
+- השתמש במשפטים קצרים יחסית, עם פסיקים והפסקות טבעיות שמייצרות קצת מתח לפני הפאנץ, אבל בלי צעקות, בלי דרמה מוגזמת ובלי להסיח את הדעת מהכביש.
+- תוסיף יותר קלילות והומור: לפחות שתיים או שלוש קריצות, דימוי משעשע או ניסוח מצחיק עדין לאורך הפסקה, אבל עדיין לשמור על עובדות אמיתיות.
 
 חוקים קשיחים לתוכן:
 - לענות תמיד בשפה שהמשתמש ביקש בלבד, בלי משפטי פתיחה כמו "שלום" או "היי".
-- להתחיל ישר בעובדת הזהב, המשפט הראשון שלך צריך כבר להכיל את הליבה המעניינת.
+- להתחיל ישר בעובדת הזהב - המשפט הראשון שלך צריך כבר להכיל את הליבה המעניינת.
 - לבחור עובדת זהב אחת בלבד, חזקה ומסקרנת, על מקום שנמצא כמה עשרות מטרים ממיקום הנהג. רק אם אין ברירה, אפשר להתרחב לכל היותר עד קילומטר אחד.
 - אם אין לך ביטחון בעובדה על מקום בטווח הזה, אמור במפורש שאתה מדבר באופן קצת יותר כללי על האזור הקרוב, ואל תמציא פרטים. עדיף להיות זהיר מאשר מדויק לכאורה.
+- אסור לך להזכיר שם של עיר, שכונה או רובע שלא הופיע במפורש בשם המקום או בכתובת שניתנו לך. אל תמציא שמות כמו "קריית המדע" או עיר אחרת אם הם לא מופיעים בנתונים.
+- אל תגיד שהנהג נמצא בעיר מסוימת אם שם העיר לא הופיע במפורש בכתובת שקיבלת.
 - אסור לספר על מקום שנמצא בבירור מעבר לקילומטר ממיקום הנהג, ובוודאי לא על עיר אחרת לגמרי.
 - הרחב בעיקר על עובדת הזהב הזאת: מה קרה, מתי זה קרה אם ידוע, למה זה חשוב היום, ואיך זה מתחבר למה שהנהג רואה סביבו.
 - אפשר להוסיף עוד פרט אחד או שניים רק אם הם מחזקים ישירות את אותה עובדה. לא להתפזר לנושאים אחרים.
 - להימנע ממשפטי תיירות כלליים כמו "זו עיר תוססת ומלאת חיים". תעדיף פרטים קונקרטיים, תאריכים, אנשים, מבנים או אירועים.
+- אל תסיים במשפט סיכום כללי בסגנון "אז בפעם הבאה שתעברו כאן..." או "אז כן, זה המקום". סיים מיד אחרי הפאנץ או אחרי העובדה המעניינת האחרונה, בלי משפט פרידה.
 - פסקה אחת זורמת, בלי נקודות רשימה, באורך בערך 80 עד 130 מילים.
 `;
   }
@@ -229,7 +239,6 @@ Règles strictes:
 // 8. /api/story-both - מקבל prompt + lat/lng + language, מחזיר טקסט + אודיו + מידע על הקול
 app.post("/api/story-both", async (req, res) => {
   try {
-    console.log("BODY FROM CLIENT:", req.body);
     const { prompt, lat, lng } = req.body;
     let { language } = req.body;
 
@@ -257,7 +266,7 @@ app.post("/api/story-both", async (req, res) => {
       )}, longitude ${lng.toFixed(4)}.`;
 
       try {
-        // מחפשים POI יחסית קרוב - רדיוס 400 מטר, אחר כך נעדיף לפי מרחק בפועל
+        // מחפשים POI קרוב - רדיוס 400 מטר, ובוחרים את הקרוב ביותר במטרים
         const places = await getNearbyPlaces(lat, lng, 400);
 
         if (places.length > 0) {
@@ -296,7 +305,7 @@ ${poiLine ? poiLine + "\n" : ""}User request: ${prompt}`;
         { role: "system", content: systemMessage },
         { role: "user", content: userMessage },
       ],
-      temperature: 0.4,
+      temperature: 0.5,
     });
 
     const storyText = completion.choices[0]?.message?.content?.trim();
@@ -323,7 +332,7 @@ ${poiLine ? poiLine + "\n" : ""}User request: ${prompt}`;
 
 // 9. Health check
 app.get("/health", (req, res) => {
-  res.json({ status: "ok", build: "golden-fact-multi-lang-nearby-v1" });
+  res.json({ status: "ok", build: "golden-fact-multi-lang-nearby-no-halluc-v2" });
 });
 
 // 10. הרצה
@@ -331,4 +340,3 @@ const PORT = process.env.PORT || 3000;
 app.listen(PORT, "0.0.0.0", () => {
   console.log(`On The Road server listening on port ${PORT}`);
 });
-
