@@ -40,14 +40,32 @@ function pickRandomVoice() {
   return { voiceName, voiceIndex, voiceKey };
 }
 
-// 3. TTS בעזרת OpenAI - מחזיר base64 + מידע על הקול
-async function ttsWithOpenAI(text) {
+// 3. TTS בעזרת OpenAI - מחזיר base64 + מידע על הקול, עם הוראות אינטונציה
+async function ttsWithOpenAI(text, language = "he") {
   const { voiceName, voiceIndex, voiceKey } = pickRandomVoice();
+
+  let instructions;
+
+  if (language === "he") {
+    // הוראות מפורטות לעברית
+    instructions =
+      "Speak in Hebrew with a clear, very natural storyteller style: medium pace, never rushed, not monotone. " +
+      "Use clear pauses at commas and full stops, as if you take a short breath. " +
+      "Build tension before punchlines, slightly raising your energy and tone before the funny or surprising part, " +
+      "then relax a bit after it. Sound like a great stand up comedian telling a short story to a driver: " +
+      "funny, warm, curious, but always easy to understand and not over-the-top.";
+  } else {
+    // הוראות כלליות לשפות אחרות, נשאיר פשוט בינתיים
+    instructions =
+      "Speak in a clear, natural storyteller voice at a medium pace, with non-monotone intonation and light humor. " +
+      "Use short pauses at commas and full stops, and build a bit of suspense before punchlines.";
+  }
 
   const response = await openai.audio.speech.create({
     model: "gpt-4o-mini-tts",
     voice: voiceName,
     input: text,
+    instructions,
   });
 
   const buffer = Buffer.from(await response.arrayBuffer());
@@ -214,10 +232,10 @@ Règles strictes:
 אתה הקריין של אפליקציית נהיגה בשם "On The Road".
 
 סטייל הדיבור:
-- אתה מדבר כמו מספר סיפורים על הכביש: שנון, חכם, משועשע, כמו קומיקאי מצליח שיודע לרתק קהל, אבל בקול רגוע וברור שמתאים לנהג שלא יכול להתרכז רק בך.
+- אתה מדבר כמו מספר סיפורים על הכביש: שנון, חכם, משועשע, כמו קומיקאי מעולה שמספר בדיחה לאוטו מלא חברים, אבל בקול רגוע וברור שמתאים לנהג שלא יכול להתרכז רק בך.
 - המטרה שלך היא לגרום לנהג לחייך, להיות מסוקרן, ולהרגיש שהוא מקבל "סוד מקומי" על המקום שהוא חולף לידו.
-- השתמש במשפטים קצרים יחסית, עם פסיקים והפסקות טבעיות שמייצרות קצת מתח לפני הפאנץ, אבל בלי צעקות, בלי דרמה מוגזמת ובלי להסיח את הדעת מהכביש.
-- תוסיף יותר קלילות והומור: לפחות שתיים או שלוש קריצות, דימוי משעשע או ניסוח מצחיק עדין לאורך הפסקה, אבל עדיין לשמור על עובדות אמיתיות.
+- השתמש במשפטים קצרים יחסית, עם פסיקים ושלוש נקודות (...) במקומות שבהם אתה רוצה עצירה קצרה ונשימה, כדי לבנות מתח לפני הפאנץ.
+- תוסיף קלילות והומור: לפחות שתיים או שלוש קריצות, דימוי משעשע או ניסוח מצחיק עדין לאורך הפסקה, אבל תמיד על בסיס עובדה אמיתית.
 
 חוקים קשיחים לתוכן:
 - לענות תמיד בשפה שהמשתמש ביקש בלבד, בלי משפטי פתיחה כמו "שלום" או "היי".
@@ -314,7 +332,7 @@ ${poiLine ? poiLine + "\n" : ""}User request: ${prompt}`;
     }
 
     const { audioBase64, voiceId, voiceIndex, voiceKey } =
-      await ttsWithOpenAI(storyText);
+      await ttsWithOpenAI(storyText, language);
 
     res.json({
       text: storyText,
@@ -332,7 +350,7 @@ ${poiLine ? poiLine + "\n" : ""}User request: ${prompt}`;
 
 // 9. Health check
 app.get("/health", (req, res) => {
-  res.json({ status: "ok", build: "golden-fact-multi-lang-nearby-short-v1" });
+  res.json({ status: "ok", build: "golden-fact-multi-lang-nearby-short-voice-v1" });
 });
 
 // 10. הרצה
