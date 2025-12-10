@@ -47,13 +47,15 @@ async function ttsWithOpenAI(text, language = "he") {
   let instructions;
 
   if (language === "he") {
-    // הוראות מפורטות לעברית
+    // הוראות מפורטות לעברית - קצת יותר מהיר, הרבה פחות מונוטוני, יותר חי
     instructions =
-      "Speak in Hebrew with a clear, very natural storyteller style: medium pace, never rushed, not monotone. " +
-      "Use clear pauses at commas and full stops, as if you take a short breath. " +
-      "Build tension before punchlines, slightly raising your energy and tone before the funny or surprising part, " +
-      "then relax a bit after it. Sound like a great stand up comedian telling a short story to a driver: " +
-      "funny, warm, curious, but always easy to understand and not over-the-top.";
+      "Speak in Hebrew with a very natural, lively storyteller style. " +
+      "Use a medium-to-fast pace: clearly faster than a slow audiobook, but never rushed or messy. " +
+      "Avoid monotone: vary your pitch and energy, especially before and during funny or surprising parts. " +
+      "Make short, clear pauses at commas and full stops, as if you take a quick breath. " +
+      "Build tension before punchlines by slightly raising your tone and energy, then relax after the joke. " +
+      "Sound like a great stand up comedian telling a short, warm story to a driver: funny, curious, playful, " +
+      "but always easy to understand and not over-the-top.";
   } else {
     // הוראות כלליות לשפות אחרות, נשאיר פשוט בינתיים
     instructions =
@@ -235,7 +237,8 @@ Règles strictes:
 - אתה מדבר כמו מספר סיפורים על הכביש: שנון, חכם, משועשע, כמו קומיקאי מעולה שמספר בדיחה לאוטו מלא חברים, אבל בקול רגוע וברור שמתאים לנהג שלא יכול להתרכז רק בך.
 - המטרה שלך היא לגרום לנהג לחייך, להיות מסוקרן, ולהרגיש שהוא מקבל "סוד מקומי" על המקום שהוא חולף לידו.
 - השתמש במשפטים קצרים יחסית, עם פסיקים ושלוש נקודות (...) במקומות שבהם אתה רוצה עצירה קצרה ונשימה, כדי לבנות מתח לפני הפאנץ.
-- תוסיף קלילות והומור: לפחות שתיים או שלוש קריצות, דימוי משעשע או ניסוח מצחיק עדין לאורך הפסקה, אבל תמיד על בסיס עובדה אמיתית.
+- שלב יותר הומור: לפחות שלוש נקודות הומור קטנות לאורך הפסקה - שאלה רטורית, דימוי מצחיק, ניסוח מפתיע, או טוויסט קטן בסוף משפט.
+- אל תחשוש מקריצה עדינה על חשבון המקום, השלט, או ההיסטוריה, כל עוד אתה נשאר מכבד ולא ציני מדי.
 
 חוקים קשיחים לתוכן:
 - לענות תמיד בשפה שהמשתמש ביקש בלבד, בלי משפטי פתיחה כמו "שלום" או "היי".
@@ -350,7 +353,10 @@ ${poiLine ? poiLine + "\n" : ""}User request: ${prompt}`;
 
 // 9. Health check
 app.get("/health", (req, res) => {
-  res.json({ status: "ok", build: "golden-fact-multi-lang-nearby-short-voice-v1" });
+  res.json({
+    status: "ok",
+    build: "golden-fact-multi-lang-nearby-short-voice-v2",
+  });
 });
 
 // 10. הרצה
