@@ -182,7 +182,7 @@ Hard rules:
 - You may add one or two extra details only if they directly reinforce that same fact. Do not drift to unrelated topics.
 - Avoid generic tourist phrases like "this is a vibrant city full of life". Prefer concrete details: dates, people, buildings, events.
 - Do not end with a generic closing sentence such as "so next time you pass here, remember...". Simply finish after the last fact or witty punchline.
-- Exactly one flowing paragraph, no bullet points, about 80 to 130 words.
+- Exactly one short flowing paragraph, no bullet points, about 40 to 70 words.
 `;
     case "fr":
       return `
@@ -206,7 +206,7 @@ Règles strictes:
 - Tu peux ajouter un ou deux détails supplémentaires seulement s’ils renforcent directement ce même fait. Ne dérive pas vers d’autres sujets.
 - Évite les phrases touristiques génériques comme "c’est une ville dynamique et pleine de vie". Préfère des détails concrets: dates, personnes, bâtiments, événements.
 - Ne termine pas par une phrase de conclusion générique du style "alors la prochaine fois que tu passeras ici, souviens toi...". Termine simplement après le dernier fait ou la dernière petite chute amusante.
-- Un seul paragraphe fluide, sans listes, d’environ 80 à 130 mots.
+- Un seul paragraphe court et fluide, sans listes, d’environ 40 à 70 mots.
 `;
     case "he":
     default:
@@ -231,7 +231,7 @@ Règles strictes:
 - אפשר להוסיף עוד פרט אחד או שניים רק אם הם מחזקים ישירות את אותה עובדה. לא להתפזר לנושאים אחרים.
 - להימנע ממשפטי תיירות כלליים כמו "זו עיר תוססת ומלאת חיים". תעדיף פרטים קונקרטיים, תאריכים, אנשים, מבנים או אירועים.
 - אל תסיים במשפט סיכום כללי בסגנון "אז בפעם הבאה שתעברו כאן..." או "אז כן, זה המקום". סיים מיד אחרי הפאנץ או אחרי העובדה המעניינת האחרונה, בלי משפט פרידה.
-- פסקה אחת זורמת, בלי נקודות רשימה, באורך בערך 80 עד 130 מילים.
+- פסקה אחת קצרה וזורמת, בלי נקודות רשימה, באורך בערך 40 עד 70 מילים.
 `;
   }
 }
@@ -332,7 +332,7 @@ ${poiLine ? poiLine + "\n" : ""}User request: ${prompt}`;
 
 // 9. Health check
 app.get("/health", (req, res) => {
-  res.json({ status: "ok", build: "golden-fact-multi-lang-nearby-no-halluc-v2" });
+  res.json({ status: "ok", build: "golden-fact-multi-lang-nearby-short-v1" });
 });
 
 // 10. הרצה
