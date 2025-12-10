@@ -65,7 +65,111 @@ async function ttsWithOpenAI(text) {
   return { audioBase64, voiceId, voiceIndex, voiceKey };
 }
 
-// 4. /api/story-both - מקבל prompt + lat/lng, מחזיר טקסט + אודיו + מידע על הקול
+// 4. Google Places - פונקציה שמביאה נקודות עניין קרובות
+async function getNearbyPlaces(lat, lng, radiusMeters = 800, includedTypes = []) {
+  if (!GOOGLE_PLACES_API_KEY) {
+    throw new Error("GOOGLE_PLACES_API_KEY is not configured");
+  }
+
+  const url = "https://places.googleapis.com/v1/places:searchNearby";
+
+  const body = {
+    locationRestriction: {
+      circle: {
+        center: {
+          latitude: lat,
+          longitude: lng,
+        },
+        radius: radiusMeters,
+      },
+    },
+    maxResultCount: 10,
+  };
+
+  if (includedTypes && includedTypes.length > 0) {
+    body.includedTypes = includedTypes;
+  } else {
+    body.includedTypes = [
+      "tourist_attraction",
+      "point_of_interest",
+      "museum",
+      "park",
+      "church",
+      "synagogue",
+      "hindu_temple",
+      "mosque",
+      "city_hall",
+    ];
+  }
+
+  const resp = await fetch(url, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "X-Goog-Api-Key": GOOGLE_PLACES_API_KEY,
+      "X-Goog-FieldMask":
+        "places.id,places.displayName,places.location,places.types,places.rating,places.shortFormattedAddress",
+    },
+    body: JSON.stringify(body),
+  });
+
+  if (!resp.ok) {
+    const text = await resp.text();
+    console.error("Google Places error:", resp.status, text);
+    throw new Error("Google Places API error");
+  }
+
+  const data = await resp.json();
+
+  const places = (data.places || []).map((p) => ({
+    id: p.id,
+    name: p.displayName?.text || "",
+    lat: p.location?.latitude,
+    lng: p.location?.longitude,
+    types: p.types || [],
+    rating: p.rating ?? null,
+    address: p.shortFormattedAddress || "",
+  }));
+
+  return places;
+}
+
+// 5. /places - מחזיר מקומות קרובים לפי lat/lng
+app.get("/places", async (req, res) => {
+  try {
+    const { lat, lng, radius, types } = req.query;
+
+    if (!lat || !lng) {
+      return res
+        .status(400)
+        .json({ error: "lat and lng query params are required" });
+    }
+
+    const radiusMeters = radius ? Number(radius) : 800;
+
+    let includedTypes = [];
+    if (types) {
+      includedTypes = String(types)
+        .split(",")
+        .map((t) => t.trim())
+        .filter(Boolean);
+    }
+
+    const places = await getNearbyPlaces(
+      Number(lat),
+      Number(lng),
+      radiusMeters,
+      includedTypes
+    );
+
+    res.json({ places });
+  } catch (err) {
+    console.error("Error in /places:", err);
+    res.status(500).json({ error: "failed_to_fetch_places" });
+  }
+});
+
+// 6. /api/story-both - מקבל prompt + lat/lng, מחזיר טקסט + אודיו + מידע על הקול
 app.post("/api/story-both", async (req, res) => {
   try {
     const { prompt, lat, lng } = req.body;
@@ -137,14 +241,13 @@ User request: ${prompt}`;
   }
 });
 
-// 5. Health check
+// 7. Health check
 app.get("/health", (req, res) => {
   res.json({ status: "ok", build: "golden-fact-he-1km-style-v1" });
 });
 
-// 6. הרצה
+// 8. הרצה
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, "0.0.0.0", () => {
   console.log(`On The Road server listening on port ${PORT}`);
 });
-
