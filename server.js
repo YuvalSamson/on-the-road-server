@@ -5,7 +5,6 @@ import cors from "cors";
 import bodyParser from "body-parser";
 import dotenv from "dotenv";
 import OpenAI from "openai";
-import fetch from "node-fetch";
 
 dotenv.config(); // טוען את .env
 
@@ -14,73 +13,50 @@ const app = express();
 app.use(cors());
 app.use(bodyParser.json());
 
-// 1. OpenAI client
+// 1. OpenAI client (גם לטקסט וגם ל-TTS)
 const openai = new OpenAI({
   apiKey: process.env.OPENAI_API_KEY,
 });
 
-// 2. ElevenLabs config
-const ELEVENLABS_API_KEY = process.env.ELEVENLABS_API_KEY;
+// 2. קולות TTS של OpenAI
+const TTS_VOICES = [
+  "coral",
+  "sage",
+  "alloy",
+  "ash",
+  "ballad",
+  "echo",
+  "fable",
+  "nova",
+  "onyx",
+  "shimmer",
+  "verse",
+];
 
-if (!ELEVENLABS_API_KEY) {
-  console.error("Missing ELEVENLABS_API_KEY in environment");
-  process.exit(1);
-}
-
-// טוענים את כל ה-VOICE_IDs מה-env
-const VOICE_IDS = [];
-for (let i = 1; i <= 10; i++) {
-  const id = process.env[`ELEVENLABS_VOICE_ID_${i}`];
-  if (id && id.trim() !== "") {
-    VOICE_IDS.push(id.trim());
-  }
-}
-
-if (VOICE_IDS.length === 0) {
-  console.error("No ELEVENLABS_VOICE_ID_x defined in environment");
-  process.exit(1);
-}
-
-// מחזיר גם את ה-id וגם את שם המשתנה (ELEVENLABS_VOICE_ID_3 וכו')
 function pickRandomVoice() {
-  const idx = Math.floor(Math.random() * VOICE_IDS.length);
-  const voiceId = VOICE_IDS[idx];
-  const index = idx + 1;
-  const voiceKey = `ELEVENLABS_VOICE_ID_${index}`;
-  return { voiceId, index, voiceKey };
+  const idx = Math.floor(Math.random() * TTS_VOICES.length);
+  const voiceName = TTS_VOICES[idx];
+  const voiceIndex = idx + 1;
+  const voiceKey = `OPENAI_VOICE_${voiceName.toUpperCase()}`;
+  return { voiceName, voiceIndex, voiceKey };
 }
 
-// 3. פונקציית TTS לאילבן לאבס עם קול רנדומלי בכל קריאה
-async function ttsWithElevenLabs(text) {
-  const { voiceId, index, voiceKey } = pickRandomVoice();
-  const url = `https://api.elevenlabs.io/v1/text-to-speech/${voiceId}`;
+// 3. TTS בעזרת OpenAI – מחזיר base64 + מידע על הקול
+async function ttsWithOpenAI(text) {
+  const { voiceName, voiceIndex, voiceKey } = pickRandomVoice();
 
-  const response = await fetch(url, {
-    method: "POST",
-    headers: {
-      "xi-api-key": ELEVENLABS_API_KEY,
-      "Content-Type": "application/json",
-      Accept: "audio/mpeg",
-    },
-    body: JSON.stringify({
-      text,
-      model_id: "eleven_turbo_v2",
-      voice_settings: {
-        stability: 0.4,
-        similarity_boost: 0.8,
-      },
-    }),
+  const response = await openai.audio.speech.create({
+    model: "gpt-4o-mini-tts",
+    voice: voiceName,
+    input: text,
   });
 
-  if (!response.ok) {
-    const textErr = await response.text();
-    console.error("ElevenLabs error:", textErr);
-    throw new Error("ElevenLabs TTS failed");
-  }
+  const buffer = Buffer.from(await response.arrayBuffer());
+  const audioBase64 = buffer.toString("base64");
 
-  const audioBuffer = await response.arrayBuffer();
-  const audioBase64 = Buffer.from(audioBuffer).toString("base64");
-  return { audioBase64, voiceId, voiceIndex: index, voiceKey };
+  const voiceId = `gpt-4o-mini-tts:${voiceName}`;
+
+  return { audioBase64, voiceId, voiceIndex, voiceKey };
 }
 
 // 4. /api/story-both - מקבל prompt + lat/lng, מחזיר טקסט + אודיו + מידע על הקול
@@ -102,17 +78,24 @@ app.post("/api/story-both", async (req, res) => {
     }
 
     const systemMessage = `
-You are the narrator of a driving app called "On The Road".
+אתה הקריין של אפליקציית נהיגה בשם "On The Road".
 
-Hard rules:
-- Length: 80 to 130 words.
-- Start immediately with something interesting about the place or region - no greetings, no small talk.
-- Use the given location as a hint: talk about the nearby area, or if unsure, about the wider region (for example: central Israel, the Mediterranean coast, or Israel in general).
-- Include 3 to 5 concrete, widely known facts (dates, historical events, famous people, landmarks, or clear geographic features).
-- Prefer to give a bit more detail on one or two "golden facts" instead of vague generalities.
-- If you are not sure about local details, clearly say you are speaking about the broader region and use only safe, well-known facts.
-- Do not invent legends, quotes, or hyper-specific anecdotes.
-- No lists or bullet points - one flowing paragraph, short and focused.
+סטייל הדיבור:
+- אתה מדבר כמו מספר סיפורים על הכביש: שנון, חכם, משועשע, כמו קומיקאי מצליח שיודע לרתק קהל – אבל בקול רגוע וברור שמתאים לנהג שלא יכול להתרכז רק בך.
+- המטרה שלך היא לגרום לנהג לחייך, להיות מסוקרן, ולהרגיש שהוא מקבל "סוד מקומי" על המקום שהוא חולף לידו.
+- השתמש במשפטים קצרים יחסית, עם פסיקים והפסקות טבעיות שמייצרות קצת מתח לפני הפאנץ', אבל בלי צעקות, בלי דרמה מוגזמת ובלי להסיח את הדעת מהכביש.
+- בסוף הפסקה כדאי שיהיה פאנץ' קטן, קריצה או ניסוח מצחיק עדין, אבל שהעובדה ההיסטורית או הגאוגרפית תישאר המרכז.
+
+חוקים קשיחים לתוכן:
+- לענות תמיד בעברית בלבד, בלי משפטי פתיחה כמו "שלום" או "היי".
+- להתחיל ישר בעובדת הזהב – המשפט הראשון שלך צריך כבר להכיל את הליבה המעניינת.
+- לבחור עובדת זהב אחת בלבד, חזקה ומסקרנת, על מקום שנמצא כמה עשרות עד מאות מטרים ממיקום הנהג. רק אם אין ברירה, אפשר להתרחב לכל היותר עד קילומטר אחד.
+- אם אין לך ביטחון בעובדה על מקום בטווח הזה, אמור במפורש שאתה מדבר באופן קצת יותר כללי על האזור הקרוב, ואל תמציא פרטים. עדיף להיות זהיר מאשר מדויק לכאורה.
+- אסור לספר על מקום שנמצא בבירור מעבר לקילומטר ממיקום הנהג, ובוודאי לא על עיר אחרת כמו אשדוד או לוד אם המיקום סביב תל אביב.
+- הרחב בעיקר על עובדת הזהב הזאת: מה קרה, מתי זה קרה אם ידוע, למה זה חשוב היום, ואיך זה מתחבר למה שהנהג רואה סביבו.
+- אפשר להוסיף עוד פרט אחד או שניים רק אם הם מחזקים ישירות את אותה עובדה. לא להתפזר לנושאים אחרים.
+- להימנע ממשפטי תיירות כלליים כמו "זו עיר תוססת ומלאת חיים". תעדיף פרטים קונקרטיים, תאריכים, אנשים, מבנים או אירועים.
+- פסקה אחת זורמת, בלי נקודות רשימה, באורך בערך 80 עד 130 מילים.
 `;
 
     const userMessage = `${locationLine}
@@ -124,7 +107,7 @@ User request: ${prompt}`;
         { role: "system", content: systemMessage },
         { role: "user", content: userMessage },
       ],
-      temperature: 0.35,
+      temperature: 0.4,
     });
 
     const storyText = completion.choices[0]?.message?.content?.trim();
@@ -133,14 +116,14 @@ User request: ${prompt}`;
     }
 
     const { audioBase64, voiceId, voiceIndex, voiceKey } =
-      await ttsWithElevenLabs(storyText);
+      await ttsWithOpenAI(storyText);
 
     res.json({
       text: storyText,
       audioBase64,
       voiceId,
       voiceIndex,
-      voiceKey, // למשל ELEVENLABS_VOICE_ID_3
+      voiceKey,
     });
   } catch (err) {
     console.error("Error in /api/story-both:", err);
@@ -150,7 +133,7 @@ User request: ${prompt}`;
 
 // 5. Health check
 app.get("/health", (req, res) => {
-  res.json({ status: "ok", build: "short-fact-v2" });
+  res.json({ status: "ok", build: "golden-fact-he-1km-style-v1" });
 });
 
 // 6. הרצה
