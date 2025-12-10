@@ -157,10 +157,26 @@ app.post("/api/story-both", async (req, res) => {
     }
 
     let locationLine = "Driver location is unknown.";
+    let poiLine = "";
+
     if (typeof lat === "number" && typeof lng === "number") {
       locationLine = `Approximate driver location: latitude ${lat.toFixed(
         4
       )}, longitude ${lng.toFixed(4)}.`;
+
+      try {
+        const places = await getNearbyPlaces(lat, lng, 800);
+        if (places.length > 0) {
+          // נבחר מקום "הכי טוב" - קודם עם דירוג, ואם אין אז הראשון
+          const best =
+            places.find((p) => p.rating !== null && p.rating !== undefined) ||
+            places[0];
+
+          poiLine = `Nearby point of interest: "${best.name}", address: ${best.address}. Use this specific place as the main focus of the story.`;
+        }
+      } catch (e) {
+        console.error("Failed to fetch places for story-both:", e);
+      }
     }
 
     const systemMessage = `
@@ -185,7 +201,7 @@ app.post("/api/story-both", async (req, res) => {
 `;
 
     const userMessage = `${locationLine}
-User request: ${prompt}`;
+${poiLine ? poiLine + "\n" : ""}User request: ${prompt}`;
 
     const completion = await openai.chat.completions.create({
       model: "gpt-4.1-mini",
