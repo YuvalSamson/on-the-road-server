@@ -37,7 +37,7 @@ const openai = new OpenAI({
   apiKey: process.env.OPENAI_API_KEY,
 });
 
-// 2. קולות TTS של OpenAI
+// 2. קולות TTS
 // בעברית - תמיד nova
 const TTS_VOICES_NON_HE = ["alloy", "fable", "shimmer"];
 
@@ -316,9 +316,8 @@ function distanceMeters(lat1, lng1, lat2, lng2) {
 
 /**
  * בחירת מקום "מועדף" ליוזר:
- * - קודם כל מחפשים מקום שהיוזר עוד לא שמע עליו
- * - מבין החדשים: הקרוב ביותר
- * - אם אין חדש: הקרוב ביותר בכלל
+ * - מחזיר רק מקום שהיוזר עדיין לא שמע עליו
+ * - אם כל המקומות כבר נשמעו - מחזיר null (כדי לא לחזור על אותו מקום)
  */
 async function pickBestPlaceForUser(places, lat, lng, userKey) {
   if (!places || places.length === 0) return null;
@@ -328,17 +327,9 @@ async function pickBestPlaceForUser(places, lat, lng, userKey) {
   let bestNew = null;
   let bestNewDist = null;
 
-  let bestOverall = null;
-  let bestOverallDist = null;
-
   for (const p of places) {
     if (typeof p.lat !== "number" || typeof p.lng !== "number") continue;
     const d = distanceMeters(lat, lng, p.lat, p.lng);
-
-    if (bestOverallDist === null || d < bestOverallDist) {
-      bestOverallDist = d;
-      bestOverall = p;
-    }
 
     if (!heardSet.has(p.id)) {
       if (bestNewDist === null || d < bestNewDist) {
@@ -356,11 +347,8 @@ async function pickBestPlaceForUser(places, lat, lng, userKey) {
     };
   }
 
-  return {
-    chosen: bestOverall,
-    distanceMeters: bestOverallDist,
-    isNew: false,
-  };
+  // אין מקום חדש - לא נבחר שום POI כדי לא לחזור על אותו מקום שוב ושוב
+  return null;
 }
 
 // 6. /places - debug
@@ -523,28 +511,30 @@ app.post("/api/story-both", async (req, res) => {
       )}, longitude ${lng.toFixed(4)}.`;
 
       try {
-        const places400 = await getNearbyPlaces(lat, lng, 400);
-        let bestInfo = await pickBestPlaceForUser(
-          places400,
-          lat,
-          lng,
-          userKey
-        );
+        // מחפשים מקום חדש בטווחים הולכים וגדלים: 400, 800, 1500 מטר
+        let bestInfo = null;
 
-        if (!bestInfo || !bestInfo.isNew) {
+        const places400 = await getNearbyPlaces(lat, lng, 400);
+        bestInfo = await pickBestPlaceForUser(places400, lat, lng, userKey);
+
+        if (!bestInfo) {
           const places800 = await getNearbyPlaces(lat, lng, 800);
-          const from800 = await pickBestPlaceForUser(
+          bestInfo = await pickBestPlaceForUser(
             places800,
             lat,
             lng,
             userKey
           );
+        }
 
-          if (from800 && from800.isNew) {
-            bestInfo = from800;
-          } else if (!bestInfo && from800) {
-            bestInfo = from800;
-          }
+        if (!bestInfo) {
+          const places1500 = await getNearbyPlaces(lat, lng, 1500);
+          bestInfo = await pickBestPlaceForUser(
+            places1500,
+            lat,
+            lng,
+            userKey
+          );
         }
 
         if (bestInfo && bestInfo.chosen) {
@@ -599,7 +589,7 @@ ${poiLine ? poiLine + "\n" : ""}User request: ${prompt}`;
 app.get("/health", (req, res) => {
   res.json({
     status: "ok",
-    build: "golden-fact-multi-lang-nearby-juicy-name-he-nova-db-v1",
+    build: "golden-fact-multi-lang-nearby-juicy-name-he-nova-db-v2-norepeat",
   });
 });
 
