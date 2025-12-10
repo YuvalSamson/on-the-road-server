@@ -40,28 +40,18 @@ function pickRandomVoice() {
   return { voiceName, voiceIndex, voiceKey };
 }
 
-// 3. TTS בעזרת OpenAI - מחזיר base64 + מידע על הקול, עם הוראות אינטונציה
+// 3. TTS בעזרת OpenAI - מחזיר base64 + מידע על הקול, עם אותן הוראות לכל השפות
 async function ttsWithOpenAI(text, language = "he") {
   const { voiceName, voiceIndex, voiceKey } = pickRandomVoice();
 
-  let instructions;
-
-  if (language === "he") {
-    // הוראות מפורטות לעברית - קצת יותר מהיר, הרבה פחות מונוטוני, יותר חי
-    instructions =
-      "Speak in Hebrew with a very natural, lively storyteller style. " +
-      "Use a medium-to-fast pace: clearly faster than a slow audiobook, but never rushed or messy. " +
-      "Avoid monotone: vary your pitch and energy, especially before and during funny or surprising parts. " +
-      "Make short, clear pauses at commas and full stops, as if you take a quick breath. " +
-      "Build tension before punchlines by slightly raising your tone and energy, then relax after the joke. " +
-      "Sound like a great stand up comedian telling a short, warm story to a driver: funny, curious, playful, " +
-      "but always easy to understand and not over-the-top.";
-  } else {
-    // הוראות כלליות לשפות אחרות, נשאיר פשוט בינתיים
-    instructions =
-      "Speak in a clear, natural storyteller voice at a medium pace, with non-monotone intonation and light humor. " +
-      "Use short pauses at commas and full stops, and build a bit of suspense before punchlines.";
-  }
+  const instructions =
+    "Speak in the same language as the input text with a very natural, lively storyteller style. " +
+    "Use a medium-to-fast pace: clearly faster than a slow audiobook, but never rushed or messy. " +
+    "Avoid monotone: vary your pitch and energy, especially before and during funny or surprising parts. " +
+    "Make short, clear pauses at commas and full stops, as if you take a quick breath. " +
+    "Build tension before punchlines by slightly raising your tone and energy, then relax after the joke. " +
+    "Sound like a great stand up comedian telling a short, warm story to a driver: funny, curious, playful, " +
+    "but always easy to understand and not over-the-top.";
 
   const response = await openai.audio.speech.create({
     model: "gpt-4o-mini-tts",
@@ -355,7 +345,7 @@ ${poiLine ? poiLine + "\n" : ""}User request: ${prompt}`;
 app.get("/health", (req, res) => {
   res.json({
     status: "ok",
-    build: "golden-fact-multi-lang-nearby-short-voice-v2",
+    build: "golden-fact-multi-lang-nearby-short-voice-v3",
   });
 });
 
