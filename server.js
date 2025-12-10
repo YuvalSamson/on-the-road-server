@@ -21,7 +21,7 @@ if (!DATABASE_URL) {
   console.warn("⚠️ DATABASE_URL is missing - using in memory only, no persistent DB");
 }
 
-// Pool ל-Postgres אם יש DATABASE_URL
+// Pool ל-Postgres אם יש DATABASE_URL, עם SSL ל-Render
 let pool = null;
 if (DATABASE_URL) {
   pool = new Pool({
@@ -43,7 +43,7 @@ const openai = new OpenAI({
 });
 
 // 2. קולות TTS
-// בעברית - תמיד nova, בשאר שפות רנדומלי מתוך כמה קולות
+// בעברית - כרגע nova, בשאר שפות רנדומלי מתוך כמה קולות
 const TTS_VOICES_NON_HE = ["alloy", "fable", "shimmer"];
 
 function pickVoice(language) {
@@ -138,8 +138,8 @@ async function initDb() {
 }
 
 // הפקת מזהה יוזר מהבקשה:
-// 1. אם יש header בשם x-user-id - משתמשים בו (עדיף, יציב אמיתי)
-// 2. אחרת IP / fallback ל-anon
+// 1. אם יש header בשם x-user-id - משתמשים בו
+// 2. אחרת IP / anon
 function getUserKeyFromRequest(req) {
   const headerId = req.headers["x-user-id"];
   if (typeof headerId === "string" && headerId.trim() !== "") {
