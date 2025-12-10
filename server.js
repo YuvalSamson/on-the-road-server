@@ -25,12 +25,7 @@ const openai = new OpenAI({
 });
 
 // 2. קולות TTS של OpenAI - קולות יותר "חיים"
-const TTS_VOICES = [
-  "alloy",
-  "nova",
-  "fable",
-  "shimmer",
-];
+const TTS_VOICES = ["alloy", "nova", "fable", "shimmer"];
 
 function pickRandomVoice() {
   const idx = Math.floor(Math.random() * TTS_VOICES.length);
@@ -40,7 +35,7 @@ function pickRandomVoice() {
   return { voiceName, voiceIndex, voiceKey };
 }
 
-// 3. TTS בעזרת OpenAI - מחזיר base64 + מידע על הקול, עם אותן הוראות לכל השפות
+// 3. TTS בעזרת OpenAI - מחזיר base64 + מידע על הקול, עם הוראות אינטונציה
 async function ttsWithOpenAI(text, language = "he") {
   const { voiceName, voiceIndex, voiceKey } = pickRandomVoice();
 
@@ -68,8 +63,53 @@ async function ttsWithOpenAI(text, language = "he") {
   return { audioBase64, voiceId, voiceIndex, voiceKey };
 }
 
-// 4. Google Places - פונקציה שמביאה נקודות עניין קרובות
-async function getNearbyPlaces(lat, lng, radiusMeters = 800) {
+/**
+ * ===== "דאטאבייס" פשוט בזיכרון =====
+ * 1. placesCache - cache של תוצאות Google Places לפי קואורדינטות+רדיוס
+ * 2. userPlacesHistory - היסטוריית מקומות של כל יוזר, כדי לא לחזור על אותו POI
+ */
+
+// cache לתוצאות Google Places
+const placesCache = new Map(); // key: "lat,lng,radius" => value: places[]
+
+function makePlacesCacheKey(lat, lng, radiusMeters) {
+  // קירוב ל-1e-4 כדי לא לקבל key שונה על כל תזוזה של סנטימטר
+  const latKey = lat.toFixed(4);
+  const lngKey = lng.toFixed(4);
+  return `${latKey},${lngKey},${radiusMeters}`;
+}
+
+// היסטוריית מקומות לכל יוזר
+// key: userKey (x-user-id או ip) => Set(placeId)
+const userPlacesHistory = new Map();
+
+function getUserKeyFromRequest(req) {
+  const headerId = req.headers["x-user-id"];
+  if (typeof headerId === "string" && headerId.trim() !== "") {
+    return `user:${headerId.trim()}`;
+  }
+  const ip =
+    (typeof req.ip === "string" && req.ip) ||
+    (typeof req.headers["x-forwarded-for"] === "string" &&
+      req.headers["x-forwarded-for"]);
+  if (ip) {
+    return `ip:${ip}`;
+  }
+  return "anon";
+}
+
+function markPlaceHeardForUser(userKey, placeId) {
+  if (!placeId) return;
+  let set = userPlacesHistory.get(userKey);
+  if (!set) {
+    set = new Set();
+    userPlacesHistory.set(userKey, set);
+  }
+  set.add(placeId);
+}
+
+// 4. Google Places - פונקציה אמיתית שמביאה נקודות עניין (קריאה ל-Google)
+async function fetchNearbyPlacesFromGoogle(lat, lng, radiusMeters = 800) {
   if (!GOOGLE_PLACES_API_KEY) {
     throw new Error("GOOGLE_PLACES_API_KEY is not configured");
   }
@@ -122,7 +162,19 @@ async function getNearbyPlaces(lat, lng, radiusMeters = 800) {
   return places;
 }
 
-// 5. פונקציה לחישוב מרחק במטרים בין הנהג לבין ה POI
+// עטיפת cache סביב fetchNearbyPlacesFromGoogle
+async function getNearbyPlaces(lat, lng, radiusMeters = 800) {
+  const key = makePlacesCacheKey(lat, lng, radiusMeters);
+  const cached = placesCache.get(key);
+  if (cached) {
+    return cached;
+  }
+  const fresh = await fetchNearbyPlacesFromGoogle(lat, lng, radiusMeters);
+  placesCache.set(key, fresh);
+  return fresh;
+}
+
+// 5. פונקציה לחישוב מרחק במטרים בין הנהג לבין ה-POI
 function distanceMeters(lat1, lng1, lat2, lng2) {
   const R = 6371000; // רדיוס כדור הארץ במטרים
   const toRad = (deg) => (deg * Math.PI) / 180;
@@ -139,6 +191,60 @@ function distanceMeters(lat1, lng1, lat2, lng2) {
 
   const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
   return R * c;
+}
+
+/**
+ * בחירת מקום "מועדף" ליוזר:
+ * - קודם כל מחפשים מקום שהיוזר עוד לא שמע עליו (id לא נמצא ב-Set)
+ * - מבין החדשים: בוחרים את הקרוב ביותר
+ * - אם אין מקום חדש בכלל: מחזירים הקרוב ביותר (dup), אבל נסמן isNew = false
+ */
+function pickBestPlaceForUser(places, lat, lng, userKey) {
+  if (!places || places.length === 0) return null;
+
+  const heardSet = userPlacesHistory.get(userKey) || new Set();
+
+  let bestNew = null;
+  let bestNewDist = null;
+
+  let bestOverall = null;
+  let bestOverallDist = null;
+
+  for (const p of places) {
+    if (typeof p.lat !== "number" || typeof p.lng !== "number") {
+      continue;
+    }
+    const d = distanceMeters(lat, lng, p.lat, p.lng);
+
+    // הכי קרוב באופן כללי
+    if (bestOverallDist === null || d < bestOverallDist) {
+      bestOverallDist = d;
+      bestOverall = p;
+    }
+
+    // מועמד חדש (שהיוזר עוד לא שמע עליו)
+    if (!heardSet.has(p.id)) {
+      if (bestNewDist === null || d < bestNewDist) {
+        bestNewDist = d;
+        bestNew = p;
+      }
+    }
+  }
+
+  if (bestNew) {
+    return {
+      chosen: bestNew,
+      distanceMeters: bestNewDist,
+      isNew: true,
+    };
+  }
+
+  // אין מקום חדש - נ fallback למקום הכי קרוב
+  return {
+    chosen: bestOverall,
+    distanceMeters: bestOverallDist,
+    isNew: false,
+  };
 }
 
 // 6. /places - מחזיר מקומות קרובים לפי lat/lng (ל debug, כללי)
@@ -268,6 +374,8 @@ app.post("/api/story-both", async (req, res) => {
       language = "he";
     }
 
+    const userKey = getUserKeyFromRequest(req);
+
     let locationLine = "Driver location is unknown.";
     let poiLine = "";
 
@@ -277,28 +385,31 @@ app.post("/api/story-both", async (req, res) => {
       )}, longitude ${lng.toFixed(4)}.`;
 
       try {
-        // מחפשים POI קרוב - רדיוס 400 מטר, ובוחרים את הקרוב ביותר במטרים
-        const places = await getNearbyPlaces(lat, lng, 400);
+        // ניסיון ראשון: רדיוס 400 מטר
+        const places400 = await getNearbyPlaces(lat, lng, 400);
+        let bestInfo = pickBestPlaceForUser(places400, lat, lng, userKey);
 
-        if (places.length > 0) {
-          let best = null;
-          let bestDist = null;
+        // אם אין מקום חדש, ננסה להגדיל רדיוס ל-800 מטר
+        if (!bestInfo || !bestInfo.isNew) {
+          const places800 = await getNearbyPlaces(lat, lng, 800);
+          const from800 = pickBestPlaceForUser(places800, lat, lng, userKey);
 
-          for (const p of places) {
-            if (typeof p.lat !== "number" || typeof p.lng !== "number") {
-              continue;
-            }
-            const d = distanceMeters(lat, lng, p.lat, p.lng);
-            if (bestDist === null || d < bestDist) {
-              bestDist = d;
-              best = p;
-            }
+          // מעדיפים מקום חדש אם נמצא ברדיוס המורחב
+          if (from800 && from800.isNew) {
+            bestInfo = from800;
+          } else if (!bestInfo && from800) {
+            // אם קודם לא היה בכלל, קח מה-800
+            bestInfo = from800;
           }
+        }
 
-          if (best) {
-            const distRounded = Math.round(bestDist ?? 0);
-            poiLine = `Nearby point of interest (distance about ${distRounded} meters): "${best.name}", address: ${best.address}. Use this specific place as the main focus of the story.`;
-          }
+        if (bestInfo && bestInfo.chosen) {
+          const best = bestInfo.chosen;
+          const distRounded = Math.round(bestInfo.distanceMeters ?? 0);
+          poiLine = `Nearby point of interest (distance about ${distRounded} meters): "${best.name}", address: ${best.address}. Use this specific place as the main focus of the story.`;
+
+          // מסמנים שהיוזר כבר שמע על המקום הזה
+          markPlaceHeardForUser(userKey, best.id);
         }
       } catch (e) {
         console.error("Failed to fetch places for story-both:", e);
@@ -345,7 +456,7 @@ ${poiLine ? poiLine + "\n" : ""}User request: ${prompt}`;
 app.get("/health", (req, res) => {
   res.json({
     status: "ok",
-    build: "golden-fact-multi-lang-nearby-short-voice-v3",
+    build: "golden-fact-multi-lang-nearby-short-voice-history-v1",
   });
 });
 
