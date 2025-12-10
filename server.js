@@ -73,8 +73,7 @@ async function ttsWithOpenAI(text, language = "he") {
 const placesCache = new Map(); // key: "lat,lng,radius" => value: places[]
 
 function makePlacesCacheKey(lat, lng, radiusMeters) {
-  // קירוב ל-1e-4 כדי לא לקבל key שונה על כל תזוזה של סנטימטר
-  const latKey = lat.toFixed(4);
+  const latKey = lat.toFixed(4); // קירוב
   const lngKey = lng.toFixed(4);
   return `${latKey},${lngKey},${radiusMeters}`;
 }
@@ -108,7 +107,7 @@ function markPlaceHeardForUser(userKey, placeId) {
   set.add(placeId);
 }
 
-// 4. Google Places - פונקציה אמיתית שמביאה נקודות עניין (קריאה ל-Google)
+// 4. Google Places - קריאה אמיתית ל-Google
 async function fetchNearbyPlacesFromGoogle(lat, lng, radiusMeters = 800) {
   if (!GOOGLE_PLACES_API_KEY) {
     throw new Error("GOOGLE_PLACES_API_KEY is not configured");
@@ -127,7 +126,6 @@ async function fetchNearbyPlacesFromGoogle(lat, lng, radiusMeters = 800) {
       },
     },
     maxResultCount: 10,
-    // לא שולחים includedTypes כדי להימנע משגיאות של Unsupported types
   };
 
   const resp = await fetch(url, {
@@ -162,7 +160,7 @@ async function fetchNearbyPlacesFromGoogle(lat, lng, radiusMeters = 800) {
   return places;
 }
 
-// עטיפת cache סביב fetchNearbyPlacesFromGoogle
+// עטיפת cache
 async function getNearbyPlaces(lat, lng, radiusMeters = 800) {
   const key = makePlacesCacheKey(lat, lng, radiusMeters);
   const cached = placesCache.get(key);
@@ -174,9 +172,9 @@ async function getNearbyPlaces(lat, lng, radiusMeters = 800) {
   return fresh;
 }
 
-// 5. פונקציה לחישוב מרחק במטרים בין הנהג לבין ה-POI
+// 5. חישוב מרחק במטרים
 function distanceMeters(lat1, lng1, lat2, lng2) {
-  const R = 6371000; // רדיוס כדור הארץ במטרים
+  const R = 6371000;
   const toRad = (deg) => (deg * Math.PI) / 180;
 
   const dLat = toRad(lat2 - lat1);
@@ -195,9 +193,9 @@ function distanceMeters(lat1, lng1, lat2, lng2) {
 
 /**
  * בחירת מקום "מועדף" ליוזר:
- * - קודם כל מחפשים מקום שהיוזר עוד לא שמע עליו (id לא נמצא ב-Set)
- * - מבין החדשים: בוחרים את הקרוב ביותר
- * - אם אין מקום חדש בכלל: מחזירים הקרוב ביותר (dup), אבל נסמן isNew = false
+ * - קודם כל מחפשים מקום שהיוזר עוד לא שמע עליו
+ * - מבין החדשים: הקרוב ביותר
+ * - אם אין חדש: הקרוב ביותר בכלל
  */
 function pickBestPlaceForUser(places, lat, lng, userKey) {
   if (!places || places.length === 0) return null;
@@ -211,18 +209,14 @@ function pickBestPlaceForUser(places, lat, lng, userKey) {
   let bestOverallDist = null;
 
   for (const p of places) {
-    if (typeof p.lat !== "number" || typeof p.lng !== "number") {
-      continue;
-    }
+    if (typeof p.lat !== "number" || typeof p.lng !== "number") continue;
     const d = distanceMeters(lat, lng, p.lat, p.lng);
 
-    // הכי קרוב באופן כללי
     if (bestOverallDist === null || d < bestOverallDist) {
       bestOverallDist = d;
       bestOverall = p;
     }
 
-    // מועמד חדש (שהיוזר עוד לא שמע עליו)
     if (!heardSet.has(p.id)) {
       if (bestNewDist === null || d < bestNewDist) {
         bestNewDist = d;
@@ -239,7 +233,6 @@ function pickBestPlaceForUser(places, lat, lng, userKey) {
     };
   }
 
-  // אין מקום חדש - נ fallback למקום הכי קרוב
   return {
     chosen: bestOverall,
     distanceMeters: bestOverallDist,
@@ -247,7 +240,7 @@ function pickBestPlaceForUser(places, lat, lng, userKey) {
   };
 }
 
-// 6. /places - מחזיר מקומות קרובים לפי lat/lng (ל debug, כללי)
+// 6. /places - debug
 app.get("/places", async (req, res) => {
   try {
     const { lat, lng, radius } = req.query;
@@ -273,7 +266,7 @@ app.get("/places", async (req, res) => {
   }
 });
 
-// 7. בחירת system prompt לפי שפה
+// 7. system prompt לפי שפה – עם איסור חזק על משפט סיום כללי
 function getSystemMessage(language) {
   switch (language) {
     case "en":
@@ -297,7 +290,8 @@ Hard rules:
 - Focus mainly on that one golden fact: what happened, when it happened if known, why it matters today, and how it connects to what the driver sees around them.
 - You may add one or two extra details only if they directly reinforce that same fact. Do not drift to unrelated topics.
 - Avoid generic tourist phrases like "this is a vibrant city full of life". Prefer concrete details: dates, people, buildings, events.
-- Do not end with a generic closing sentence such as "so next time you pass here, remember...". Simply finish after the last fact or witty punchline.
+- Do not end with any generic wrap-up sentence such as "so next time you pass here, remember...", "so yes, this is the place", "in short" or any meta summary of what you just said.
+- The last sentence must contain a specific factual or humorous detail about the place itself, not a general reflection or conclusion.
 - Exactly one short flowing paragraph, no bullet points, about 40 to 70 words.
 `;
     case "fr":
@@ -321,7 +315,8 @@ Règles strictes:
 - Concentre-toi surtout sur ce fait en or: ce qui s’est passé, quand cela s’est passé si on le sait, pourquoi c’est important aujourd’hui, et comment cela se connecte à ce que le conducteur voit autour de lui.
 - Tu peux ajouter un ou deux détails supplémentaires seulement s’ils renforcent directement ce même fait. Ne dérive pas vers d’autres sujets.
 - Évite les phrases touristiques génériques comme "c’est une ville dynamique et pleine de vie". Préfère des détails concrets: dates, personnes, bâtiments, événements.
-- Ne termine pas par une phrase de conclusion générique du style "alors la prochaine fois que tu passeras ici, souviens toi...". Termine simplement après le dernier fait ou la dernière petite chute amusante.
+- Ne termine pas par une phrase de conclusion générique ou méta du type "alors la prochaine fois que tu passeras ici...", "en bref", "voilà pour cet endroit". Termine simplement après le dernier détail concret ou la dernière petite chute amusante.
+- La dernière phrase doit contenir un détail précis ou une touche d'humour sur le lieu lui-même, et non une réflexion générale ou un résumé.
 - Un seul paragraphe court et fluide, sans listes, d’environ 40 à 70 mots.
 `;
     case "he":
@@ -347,13 +342,14 @@ Règles strictes:
 - הרחב בעיקר על עובדת הזהב הזאת: מה קרה, מתי זה קרה אם ידוע, למה זה חשוב היום, ואיך זה מתחבר למה שהנהג רואה סביבו.
 - אפשר להוסיף עוד פרט אחד או שניים רק אם הם מחזקים ישירות את אותה עובדה. לא להתפזר לנושאים אחרים.
 - להימנע ממשפטי תיירות כלליים כמו "זו עיר תוססת ומלאת חיים". תעדיף פרטים קונקרטיים, תאריכים, אנשים, מבנים או אירועים.
-- אל תסיים במשפט סיכום כללי בסגנון "אז בפעם הבאה שתעברו כאן..." או "אז כן, זה המקום". סיים מיד אחרי הפאנץ או אחרי העובדה המעניינת האחרונה, בלי משפט פרידה.
+- אסור לך לסיים במשפט סיכום כללי או סתמי, כמו "אז בפעם הבאה שתעברו כאן...", "אז כן, זה המקום", "בקיצור" או כל משפט שמסכם או מדבר על מה שסיפרת עכשיו.
+- המשפט האחרון שלך חייב להכיל פרט קונקרטי או פאנץ' קטן על המקום עצמו – לא מחשבה כללית, לא סיכום, ולא המלצה לעתיד.
 - פסקה אחת קצרה וזורמת, בלי נקודות רשימה, באורך בערך 40 עד 70 מילים.
 `;
   }
 }
 
-// 8. /api/story-both - מקבל prompt + lat/lng + language, מחזיר טקסט + אודיו + מידע על הקול
+// 8. /api/story-both
 app.post("/api/story-both", async (req, res) => {
   try {
     const { prompt, lat, lng } = req.body;
@@ -365,7 +361,6 @@ app.post("/api/story-both", async (req, res) => {
         .json({ error: "Missing 'prompt' in request body (string required)" });
     }
 
-    // ברירת מחדל - עברית
     if (!language || typeof language !== "string") {
       language = "he";
     }
@@ -385,20 +380,16 @@ app.post("/api/story-both", async (req, res) => {
       )}, longitude ${lng.toFixed(4)}.`;
 
       try {
-        // ניסיון ראשון: רדיוס 400 מטר
         const places400 = await getNearbyPlaces(lat, lng, 400);
         let bestInfo = pickBestPlaceForUser(places400, lat, lng, userKey);
 
-        // אם אין מקום חדש, ננסה להגדיל רדיוס ל-800 מטר
         if (!bestInfo || !bestInfo.isNew) {
           const places800 = await getNearbyPlaces(lat, lng, 800);
           const from800 = pickBestPlaceForUser(places800, lat, lng, userKey);
 
-          // מעדיפים מקום חדש אם נמצא ברדיוס המורחב
           if (from800 && from800.isNew) {
             bestInfo = from800;
           } else if (!bestInfo && from800) {
-            // אם קודם לא היה בכלל, קח מה-800
             bestInfo = from800;
           }
         }
@@ -408,7 +399,6 @@ app.post("/api/story-both", async (req, res) => {
           const distRounded = Math.round(bestInfo.distanceMeters ?? 0);
           poiLine = `Nearby point of interest (distance about ${distRounded} meters): "${best.name}", address: ${best.address}. Use this specific place as the main focus of the story.`;
 
-          // מסמנים שהיוזר כבר שמע על המקום הזה
           markPlaceHeardForUser(userKey, best.id);
         }
       } catch (e) {
@@ -456,7 +446,7 @@ ${poiLine ? poiLine + "\n" : ""}User request: ${prompt}`;
 app.get("/health", (req, res) => {
   res.json({
     status: "ok",
-    build: "golden-fact-multi-lang-nearby-short-voice-history-v1",
+    build: "golden-fact-multi-lang-nearby-short-voice-history-nogeneric-v1",
   });
 });
 
