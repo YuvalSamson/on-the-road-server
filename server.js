@@ -24,7 +24,12 @@ if (!DATABASE_URL) {
 // Pool ל-Postgres אם יש DATABASE_URL
 let pool = null;
 if (DATABASE_URL) {
-  pool = new Pool({ connectionString: DATABASE_URL });
+  pool = new Pool({
+    connectionString: DATABASE_URL,
+    ssl: {
+      rejectUnauthorized: false,
+    },
+  });
 }
 
 // אפליקציה
@@ -608,3 +613,4 @@ const PORT = process.env.PORT || 3000;
 app.listen(PORT, "0.0.0.0", () => {
   console.log(`On The Road server listening on port ${PORT}`);
 });
+
