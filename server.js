@@ -16,10 +16,12 @@ if (!GOOGLE_PLACES_API_KEY) {
   console.warn("⚠️ GOOGLE_PLACES_API_KEY is missing in env");
 }
 if (!DATABASE_URL) {
-  console.warn("⚠️ DATABASE_URL is missing - using in memory only, no persistent DB");
+  console.warn(
+    "⚠️ DATABASE_URL is missing - using in memory only, no persistent DB"
+  );
 }
 
-// Postgres pool
+// Pool for Postgres if DATABASE_URL exists (Render SSL)
 let pool = null;
 if (DATABASE_URL) {
   pool = new Pool({
@@ -33,25 +35,23 @@ const app = express();
 app.use(cors());
 app.use(bodyParser.json());
 
-// OpenAI
+// OpenAI client
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
-// TTS voices
+// ===== TTS =====
 const TTS_VOICES_NON_HE = ["alloy", "fable", "shimmer"];
 
 function pickVoice(language) {
   if (language === "he") {
-    const voiceName = "nova";
-    const voiceIndex = 1;
-    const voiceKey = "OPENAI_VOICE_NOVA";
-    return { voiceName, voiceIndex, voiceKey };
+    return { voiceName: "nova", voiceIndex: 1, voiceKey: "OPENAI_VOICE_NOVA" };
   }
-
   const idx = Math.floor(Math.random() * TTS_VOICES_NON_HE.length);
   const voiceName = TTS_VOICES_NON_HE[idx];
-  const voiceIndex = idx + 1;
-  const voiceKey = `OPENAI_VOICE_${voiceName.toUpperCase()}`;
-  return { voiceName, voiceIndex, voiceKey };
+  return {
+    voiceName,
+    voiceIndex: idx + 1,
+    voiceKey: `OPENAI_VOICE_${voiceName.toUpperCase()}`,
+  };
 }
 
 async function ttsWithOpenAI(text, language = "he") {
@@ -76,27 +76,23 @@ async function ttsWithOpenAI(text, language = "he") {
   const buffer = Buffer.from(await response.arrayBuffer());
   const audioBase64 = buffer.toString("base64");
   const voiceId = `gpt-4o-mini-tts:${voiceName}`;
-
   return { audioBase64, voiceId, voiceIndex, voiceKey };
 }
 
 /**
- * ===== DB + cache =====
- * places_cache: cache JSON by cache_key
- * user_place_history: per-user history of POI ids (we store generic poi_id strings)
+ * ===== DB + caches =====
+ * places_cache: cache_key => pois_json
+ * user_place_history: user_key + place_id (we store unified ids like osm:..., wd:..., gp:...)
  */
 
-// in-memory cache
-const placesCacheMemory = new Map(); // key => array
-const userPlacesHistoryMemory = new Map(); // userKey => Set(poiId)
+const placesCacheMemory = new Map(); // cache_key => pois[]
+const userPlacesHistoryMemory = new Map(); // userKey => Set(placeId)
+const wikidataFactsMemory = new Map(); // qid|lang => { facts, sources }
 
-// extra cache for wikidata facts
-const wikidataFactsMemory = new Map(); // qid|lang => { facts:[], sources:[] }
-
-function makePlacesCacheKey(lat, lng, radiusMeters, mode = "mixed") {
+function makeCacheKey(lat, lng, radiusMeters, mode = "interesting", language = "en") {
   const latKey = lat.toFixed(4);
   const lngKey = lng.toFixed(4);
-  return `${mode}:${latKey},${lngKey},${radiusMeters}`;
+  return `${mode}:${language}:${latKey},${lngKey},${radiusMeters}`;
 }
 
 async function initDb() {
@@ -156,9 +152,7 @@ async function getHeardSetForUser(userKey) {
         "SELECT place_id FROM user_place_history WHERE user_key = $1",
         [userKey]
       );
-      for (const row of rows) {
-        set.add(row.place_id);
-      }
+      for (const row of rows) set.add(row.place_id);
     } catch (err) {
       console.error("DB error in getHeardSetForUser:", err);
     }
@@ -190,10 +184,11 @@ async function markPlaceHeardForUser(userKey, placeId) {
   }
 }
 
-// distance meters
+// ===== Geo helpers =====
 function distanceMeters(lat1, lng1, lat2, lng2) {
   const R = 6371000;
   const toRad = (deg) => (deg * Math.PI) / 180;
+
   const dLat = toRad(lat2 - lat1);
   const dLng = toRad(lng2 - lng1);
 
@@ -208,14 +203,21 @@ function distanceMeters(lat1, lng1, lat2, lng2) {
   return R * c;
 }
 
-// ===== Google Places (kept as fallback) =====
+function abortableFetch(url, options, timeoutMs) {
+  const controller = new AbortController();
+  const t = setTimeout(() => controller.abort(), timeoutMs);
+  return fetch(url, { ...options, signal: controller.signal }).finally(() =>
+    clearTimeout(t)
+  );
+}
+
+// ===== Source 1: Google Places (fallback) =====
 async function fetchNearbyPlacesFromGoogle(lat, lng, radiusMeters = 800) {
   if (!GOOGLE_PLACES_API_KEY) {
     throw new Error("GOOGLE_PLACES_API_KEY is not configured");
   }
 
   const url = "https://places.googleapis.com/v1/places:searchNearby";
-
   const body = {
     locationRestriction: {
       circle: {
@@ -226,16 +228,20 @@ async function fetchNearbyPlacesFromGoogle(lat, lng, radiusMeters = 800) {
     maxResultCount: 10,
   };
 
-  const resp = await fetch(url, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      "X-Goog-Api-Key": GOOGLE_PLACES_API_KEY,
-      "X-Goog-FieldMask":
-        "places.id,places.displayName,places.location,places.types,places.rating,places.shortFormattedAddress",
+  const resp = await abortableFetch(
+    url,
+    {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "X-Goog-Api-Key": GOOGLE_PLACES_API_KEY,
+        "X-Goog-FieldMask":
+          "places.id,places.displayName,places.location,places.types,places.rating,places.shortFormattedAddress",
+      },
+      body: JSON.stringify(body),
     },
-    body: JSON.stringify(body),
-  });
+    9000
+  );
 
   if (!resp.ok) {
     const text = await resp.text();
@@ -244,7 +250,6 @@ async function fetchNearbyPlacesFromGoogle(lat, lng, radiusMeters = 800) {
   }
 
   const data = await resp.json();
-
   const places = (data.places || []).map((p) => ({
     id: `gp:${p.id}`,
     name: p.displayName?.text || "",
@@ -260,11 +265,11 @@ async function fetchNearbyPlacesFromGoogle(lat, lng, radiusMeters = 800) {
   return places;
 }
 
-// ===== OSM Overpass =====
+// ===== Source 2: OpenStreetMap via Overpass =====
 const OVERPASS_URL = "https://overpass-api.de/api/interpreter";
 
 function overpassQuery(lat, lng, radiusMeters) {
-  // Focus on non-business POIs: historic, tourism attractions/viewpoints, memorials, natural
+  // Non-business POI focus: historic, tourism attractions/viewpoints, memorials, natural
   return `
 [out:json][timeout:12];
 (
@@ -288,7 +293,7 @@ function overpassQuery(lat, lng, radiusMeters) {
   way(around:${radiusMeters},${lat},${lng})[natural];
   relation(around:${radiusMeters},${lat},${lng})[natural];
 );
-out center tags 40;
+out center tags 60;
 `.trim();
 }
 
@@ -298,46 +303,50 @@ function safeTag(tags, key) {
   return typeof v === "string" ? v : "";
 }
 
-function normalizeNameFromOsm(tags) {
+function bestNameFromOsm(tags) {
   const n = safeTag(tags, "name");
   if (n) return n;
-  const en = safeTag(tags, "name:en");
-  if (en) return en;
   const he = safeTag(tags, "name:he");
   if (he) return he;
+  const en = safeTag(tags, "name:en");
+  if (en) return en;
   return "";
 }
 
 function osmElementToPoi(el) {
-  const type = el.type; // node/way/relation
+  const type = el.type;
   const id = el.id;
   const tags = el.tags || {};
-  const name = normalizeNameFromOsm(tags);
+  const name = bestNameFromOsm(tags);
 
   let lat = null;
   let lng = null;
-
   if (type === "node") {
     lat = el.lat;
     lng = el.lon;
-  } else {
-    // ways/relations
-    if (el.center && typeof el.center.lat === "number" && typeof el.center.lon === "number") {
-      lat = el.center.lat;
-      lng = el.center.lon;
-    }
+  } else if (el.center) {
+    lat = el.center.lat;
+    lng = el.center.lon;
   }
 
   if (typeof lat !== "number" || typeof lng !== "number") return null;
 
   const wikidataId = safeTag(tags, "wikidata") || null;
 
+  // keep a short "kind" hint
+  const kind =
+    safeTag(tags, "historic") ||
+    safeTag(tags, "tourism") ||
+    safeTag(tags, "natural") ||
+    safeTag(tags, "memorial") ||
+    "";
+
   return {
     id: `osm:${type}/${id}`,
     name: name || "",
     lat,
     lng,
-    types: Object.keys(tags).slice(0, 10),
+    types: kind ? [kind] : [],
     rating: null,
     address: "",
     source: "osm",
@@ -349,48 +358,43 @@ function osmElementToPoi(el) {
 async function fetchNearbyPoisFromOSM(lat, lng, radiusMeters = 800) {
   const q = overpassQuery(lat, lng, radiusMeters);
 
-  const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), 9000);
-
-  try {
-    const resp = await fetch(OVERPASS_URL, {
+  const resp = await abortableFetch(
+    OVERPASS_URL,
+    {
       method: "POST",
       headers: {
         "Content-Type": "text/plain; charset=utf-8",
-        "User-Agent": "on-the-road-server/1.0 (contact: not-set)",
+        "User-Agent": "on-the-road-server/1.0",
       },
       body: q,
-      signal: controller.signal,
-    });
+    },
+    9000
+  );
 
-    if (!resp.ok) {
-      const text = await resp.text();
-      console.error("Overpass error:", resp.status, text.slice(0, 400));
-      throw new Error("Overpass API error");
-    }
-
-    const data = await resp.json();
-
-    const elements = Array.isArray(data.elements) ? data.elements : [];
-    const pois = [];
-
-    for (const el of elements) {
-      const poi = osmElementToPoi(el);
-      if (!poi) continue;
-
-      // must have at least a name or a wikidata id
-      if (!poi.name && !poi.wikidataId) continue;
-
-      pois.push(poi);
-    }
-
-    return pois.slice(0, 30);
-  } finally {
-    clearTimeout(timeout);
+  if (!resp.ok) {
+    const text = await resp.text();
+    console.error("Overpass error:", resp.status, text.slice(0, 400));
+    throw new Error("Overpass API error");
   }
+
+  const data = await resp.json();
+  const elements = Array.isArray(data.elements) ? data.elements : [];
+
+  const pois = [];
+  for (const el of elements) {
+    const poi = osmElementToPoi(el);
+    if (!poi) continue;
+
+    // must have a name or wikidata id
+    if (!poi.name && !poi.wikidataId) continue;
+
+    pois.push(poi);
+  }
+
+  return pois.slice(0, 30);
 }
 
-// ===== Wikidata SPARQL around =====
+// ===== Source 3: Wikidata around via SPARQL =====
 const WIKIDATA_SPARQL = "https://query.wikidata.org/sparql";
 
 function qidFromEntityUrl(url) {
@@ -400,7 +404,7 @@ function qidFromEntityUrl(url) {
 }
 
 async function fetchNearbyPoisFromWikidata(lat, lng, radiusMeters = 800, language = "en") {
-  const radiusKm = Math.max(0.1, Math.min(5, radiusMeters / 1000));
+  const radiusKm = Math.max(0.2, Math.min(5, radiusMeters / 1000));
 
   const query = `
 SELECT ?item ?itemLabel ?itemDescription ?lat ?lon WHERE {
@@ -418,62 +422,58 @@ LIMIT 25
 
   const url = `${WIKIDATA_SPARQL}?format=json&query=${encodeURIComponent(query)}`;
 
-  const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), 9000);
-
-  try {
-    const resp = await fetch(url, {
+  const resp = await abortableFetch(
+    url,
+    {
       method: "GET",
       headers: {
         "Accept": "application/sparql-results+json",
-        "User-Agent": "on-the-road-server/1.0 (contact: not-set)",
+        "User-Agent": "on-the-road-server/1.0",
       },
-      signal: controller.signal,
-    });
+    },
+    9000
+  );
 
-    if (!resp.ok) {
-      const text = await resp.text();
-      console.error("Wikidata around error:", resp.status, text.slice(0, 400));
-      throw new Error("Wikidata SPARQL error");
-    }
-
-    const data = await resp.json();
-    const bindings = data?.results?.bindings || [];
-
-    const pois = [];
-    for (const b of bindings) {
-      const qid = qidFromEntityUrl(b.item?.value);
-      if (!qid) continue;
-
-      const name = b.itemLabel?.value || "";
-      const desc = b.itemDescription?.value || "";
-      const latV = Number(b.lat?.value);
-      const lngV = Number(b.lon?.value);
-
-      if (!Number.isFinite(latV) || !Number.isFinite(lngV)) continue;
-      if (!name) continue;
-
-      pois.push({
-        id: `wd:${qid}`,
-        name,
-        lat: latV,
-        lng: lngV,
-        types: [],
-        rating: null,
-        address: "",
-        source: "wikidata",
-        wikidataId: qid,
-        description: desc,
-      });
-    }
-
-    return pois;
-  } finally {
-    clearTimeout(timeout);
+  if (!resp.ok) {
+    const text = await resp.text();
+    console.error("Wikidata around error:", resp.status, text.slice(0, 400));
+    throw new Error("Wikidata SPARQL error");
   }
+
+  const data = await resp.json();
+  const bindings = data?.results?.bindings || [];
+
+  const pois = [];
+  for (const b of bindings) {
+    const qid = qidFromEntityUrl(b.item?.value);
+    if (!qid) continue;
+
+    const name = b.itemLabel?.value || "";
+    const desc = b.itemDescription?.value || "";
+    const latV = Number(b.lat?.value);
+    const lngV = Number(b.lon?.value);
+
+    if (!Number.isFinite(latV) || !Number.isFinite(lngV)) continue;
+    if (!name) continue;
+
+    pois.push({
+      id: `wd:${qid}`,
+      name,
+      lat: latV,
+      lng: lngV,
+      types: [],
+      rating: null,
+      address: "",
+      source: "wikidata",
+      wikidataId: qid,
+      description: desc,
+    });
+  }
+
+  return pois;
 }
 
-// ===== Wikidata facts =====
+// ===== Wikidata facts (light) =====
 async function fetchWikidataFacts(qid, language = "en") {
   if (!qid) return { facts: [], sources: [] };
 
@@ -482,7 +482,7 @@ async function fetchWikidataFacts(qid, language = "en") {
   if (cached) return cached;
 
   const query = `
-SELECT ?itemLabel ?itemDescription ?inception ?inceptionLabel ?namedAfterLabel ?architectLabel ?instanceLabel WHERE {
+SELECT ?itemLabel ?itemDescription ?inceptionLabel ?namedAfterLabel ?architectLabel ?instanceLabel WHERE {
   BIND(wd:${qid} AS ?item)
   OPTIONAL { ?item wdt:P571 ?inception . }
   OPTIONAL { ?item wdt:P138 ?namedAfter . }
@@ -495,18 +495,18 @@ LIMIT 1
 
   const url = `${WIKIDATA_SPARQL}?format=json&query=${encodeURIComponent(query)}`;
 
-  const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), 9000);
-
   try {
-    const resp = await fetch(url, {
-      method: "GET",
-      headers: {
-        "Accept": "application/sparql-results+json",
-        "User-Agent": "on-the-road-server/1.0 (contact: not-set)",
+    const resp = await abortableFetch(
+      url,
+      {
+        method: "GET",
+        headers: {
+          "Accept": "application/sparql-results+json",
+          "User-Agent": "on-the-road-server/1.0",
+        },
       },
-      signal: controller.signal,
-    });
+      9000
+    );
 
     if (!resp.ok) {
       const text = await resp.text();
@@ -518,18 +518,16 @@ LIMIT 1
     const b = data?.results?.bindings?.[0];
     if (!b) return { facts: [], sources: [] };
 
-    const label = b.itemLabel?.value || "";
     const desc = b.itemDescription?.value || "";
     const instance = b.instanceLabel?.value || "";
-    const inceptionLabel = b.inceptionLabel?.value || "";
+    const inception = b.inceptionLabel?.value || "";
     const namedAfter = b.namedAfterLabel?.value || "";
     const architect = b.architectLabel?.value || "";
 
     const facts = [];
-
-    if (label && instance) facts.push(`It is a ${instance}.`);
-    if (desc) facts.push(`Short description: ${desc}.`);
-    if (inceptionLabel) facts.push(`Inception or opening: ${inceptionLabel}.`);
+    if (instance) facts.push(`Type: ${instance}.`);
+    if (desc) facts.push(`Description: ${desc}.`);
+    if (inception) facts.push(`Inception: ${inception}.`);
     if (namedAfter) facts.push(`Named after: ${namedAfter}.`);
     if (architect) facts.push(`Architect: ${architect}.`);
 
@@ -540,14 +538,15 @@ LIMIT 1
     const result = { facts: facts.slice(0, 5), sources };
     wikidataFactsMemory.set(cacheKey, result);
     return result;
-  } finally {
-    clearTimeout(timeout);
+  } catch (e) {
+    console.error("Wikidata facts fetch failed:", e);
+    return { facts: [], sources: [] };
   }
 }
 
-// ===== Unified POI fetch with cache =====
+// ===== Unified POI retrieval + cache =====
 async function getNearbyPois(lat, lng, radiusMeters = 800, mode = "interesting", language = "en") {
-  const key = makePlacesCacheKey(lat, lng, radiusMeters, mode);
+  const key = makeCacheKey(lat, lng, radiusMeters, mode, language);
 
   const mem = placesCacheMemory.get(key);
   if (mem) return mem;
@@ -569,31 +568,29 @@ async function getNearbyPois(lat, lng, radiusMeters = 800, mode = "interesting",
   }
 
   let pois = [];
+
   if (mode === "interesting") {
-    // Prefer OSM + Wikidata
-    const [osm, wd] = await Promise.allSettled([
+    const [osmRes, wdRes] = await Promise.allSettled([
       fetchNearbyPoisFromOSM(lat, lng, radiusMeters),
       fetchNearbyPoisFromWikidata(lat, lng, radiusMeters, language),
     ]);
 
-    if (osm.status === "fulfilled") pois = pois.concat(osm.value);
-    if (wd.status === "fulfilled") pois = pois.concat(wd.value);
+    if (osmRes.status === "fulfilled") pois = pois.concat(osmRes.value);
+    if (wdRes.status === "fulfilled") pois = pois.concat(wdRes.value);
 
-    // If nothing, fallback to Google Places
+    // fallback to Google only if no results
     if (pois.length === 0) {
       try {
-        const gp = await fetchNearbyPlacesFromGoogle(lat, lng, radiusMeters);
-        pois = gp;
+        pois = await fetchNearbyPlacesFromGoogle(lat, lng, radiusMeters);
       } catch (e) {
         // ignore
       }
     }
   } else {
-    // Legacy mode: Google Places
     pois = await fetchNearbyPlacesFromGoogle(lat, lng, radiusMeters);
   }
 
-  // light de-dupe by coordinate + name
+  // de-dupe by name+coord (light)
   const seen = new Set();
   const deduped = [];
   for (const p of pois) {
@@ -627,13 +624,12 @@ async function getNearbyPois(lat, lng, radiusMeters = 800, mode = "interesting",
   return deduped;
 }
 
-// ===== Pick best POI with "quality gate" =====
+// ===== Picking logic with quality gate =====
 async function pickBestPoiForUser(pois, lat, lng, userKey, language) {
   if (!pois || pois.length === 0) return null;
 
   const heardSet = await getHeardSetForUser(userKey);
 
-  // score candidates
   const candidates = [];
   for (const p of pois) {
     if (typeof p.lat !== "number" || typeof p.lng !== "number") continue;
@@ -643,33 +639,49 @@ async function pickBestPoiForUser(pois, lat, lng, userKey, language) {
 
     if (heardSet.has(p.id)) continue;
 
-    // bonus for wikidata id (more likely to have facts)
-    const hasWd = !!(p.wikidataId && typeof p.wikidataId === "string");
-    const bonus = hasWd ? 250 : 0;
+    const qid =
+      p.wikidataId ||
+      (typeof p.id === "string" && p.id.startsWith("wd:")
+        ? p.id.replace("wd:", "")
+        : null);
 
+    const hasFactsHook = !!qid;
+    const bonus = hasFactsHook ? 250 : 0; // prefer items with facts
     const score = d - bonus;
 
-    candidates.push({ p, d, score });
+    candidates.push({ p, d, score, qid });
   }
 
   candidates.sort((a, b) => a.score - b.score);
 
-  // quality gate: need at least 2 facts
-  for (const c of candidates.slice(0, 10)) {
-    const poi = c.p;
+  const lang = language === "he" ? "he" : "en";
 
-    const qid = poi.wikidataId || (poi.id.startsWith("wd:") ? poi.id.replace("wd:", "") : null);
-    const { facts, sources } = qid ? await fetchWikidataFacts(qid, language === "he" ? "he" : "en") : { facts: [], sources: [] };
+  for (const c of candidates.slice(0, 12)) {
+    const qid = c.qid;
+    let facts = [];
+    let sources = [];
 
-    // Accept if enough facts, or if we have a good description
-    const enough = facts.length >= 2 || (typeof poi.description === "string" && poi.description.trim().length > 20);
+    if (qid) {
+      const r = await fetchWikidataFacts(qid, lang);
+      facts = r.facts;
+      sources = r.sources;
+    } else if (typeof c.p.description === "string" && c.p.description.trim().length > 0) {
+      facts = [`Description: ${c.p.description.trim()}.`];
+      sources = [];
+    }
 
-    if (enough) {
+    // Quality gate: at least 2 factual lines OR 1 strong description line (long enough)
+    const descOk =
+      facts.length >= 2 ||
+      (facts.length === 1 && facts[0].length >= 50);
+
+    if (descOk) {
       return {
-        chosen: poi,
+        chosen: c.p,
         distanceMeters: c.d,
         facts,
         sources,
+        qid,
       };
     }
   }
@@ -677,24 +689,22 @@ async function pickBestPoiForUser(pois, lat, lng, userKey, language) {
   return null;
 }
 
-// ===== system prompts (tighten anti-hallucination) =====
+// ===== System message: enforce no hallucination =====
 function getSystemMessage(language) {
   if (language === "en") {
     return `
 You are the storyteller voice of a driving app.
 
-Hard truth rules:
-- Use ONLY the factual notes provided to you under "FACTS". If a detail is not in FACTS, you must not state it as fact.
-- If FACTS are too thin, produce "NO_STORY" exactly.
+Truth rules:
+- Use ONLY the facts provided under FACTS.
+- If a detail is not in FACTS, do not state it as fact.
+- If FACTS are too thin, return exactly: NO_STORY
 
-Speaking style:
+Style:
 - Short, witty, surprising, but factual and deep.
 - Exactly one paragraph, 40 to 70 words.
-
-Other rules:
 - No greetings.
 - Start immediately with the most interesting fact.
-- No city name unless it appears in the provided place name or address line.
 `.trim();
   }
 
@@ -703,46 +713,43 @@ Other rules:
 Tu es la voix d'un conteur pour une application de conduite.
 
 Règles de vérité:
-- Utilise UNIQUEMENT les notes factuelles fournies sous "FACTS". Si ce n'est pas dans FACTS, tu ne dois pas l'affirmer.
-- Si FACTS est trop pauvre, réponds exactement "NO_STORY".
+- Utilise UNIQUEMENT les faits fournis sous FACTS.
+- Si ce n'est pas dans FACTS, ne l'affirme pas.
+- Si FACTS est trop pauvre, réponds exactement: NO_STORY
 
 Style:
 - Court, surprenant, avec une touche d'humour, mais factuel et un peu profond.
 - Un seul paragraphe, 40 à 70 mots.
-
-Autres règles:
 - Pas de salutations.
 - Commence directement par le fait le plus intéressant.
-- Ne mentionne pas une ville si elle n'apparaît pas dans le nom ou l'adresse fournis.
 `.trim();
   }
 
-  // he
   return `
 אתה הקריין של אפליקציית נהיגה.
 
 חוקי אמת:
-- אתה משתמש רק בעובדות שניתנו לך תחת "FACTS". אם פרט לא נמצא ב-FACTS אסור לך להציג אותו כעובדה.
-- אם FACTS דל מדי, אתה מחזיר בדיוק "NO_STORY".
+- אתה משתמש רק בעובדות שניתנו לך תחת FACTS.
+- אם פרט לא נמצא ב-FACTS אסור לך להציג אותו כעובדה.
+- אם FACTS דל מדי, אתה מחזיר בדיוק: NO_STORY
 
 סגנון:
 - קצר, שנון, מפתיע, אבל מדויק ועם עומק.
 - פסקה אחת בלבד, 40 עד 70 מילים.
-
-חוקים נוספים:
 - בלי ברכות פתיחה.
 - להתחיל ישר בעובדה הכי מעניינת.
-- לא לציין שם עיר אם הוא לא מופיע במפורש בשם המקום או בשורת הכתובת שניתנו לך.
 `.trim();
 }
 
-// ===== debug endpoint =====
+// ===== Debug: /places =====
 app.get("/places", async (req, res) => {
   try {
     const { lat, lng, radius, mode, language } = req.query;
 
     if (!lat || !lng) {
-      return res.status(400).json({ error: "lat and lng query params are required" });
+      return res
+        .status(400)
+        .json({ error: "lat and lng query params are required" });
     }
 
     const radiusMeters = radius ? Number(radius) : 800;
@@ -757,14 +764,16 @@ app.get("/places", async (req, res) => {
   }
 });
 
-// ===== main endpoint =====
+// ===== Main API: /api/story-both =====
 app.post("/api/story-both", async (req, res) => {
   try {
     const { prompt, lat, lng } = req.body;
     let { language } = req.body;
 
     if (!prompt || typeof prompt !== "string") {
-      return res.status(400).json({ error: "Missing 'prompt' in request body (string required)" });
+      return res
+        .status(400)
+        .json({ error: "Missing 'prompt' in request body (string required)" });
     }
 
     if (!language || typeof language !== "string") language = "he";
@@ -773,68 +782,58 @@ app.post("/api/story-both", async (req, res) => {
 
     const userKey = getUserKeyFromRequest(req);
 
-    let locationLine = "Driver location is unknown.";
-    let poiLine = "";
-    let factsBlock = "";
-    let sources = [];
-    let chosenPoiId = null;
-
-    if (typeof lat === "number" && typeof lng === "number") {
-      locationLine = `Approximate driver location: latitude ${lat.toFixed(4)}, longitude ${lng.toFixed(4)}.`;
-
-      try {
-        // Expand radius gradually
-        const radii = [400, 800, 1500];
-        let best = null;
-
-        for (const r of radii) {
-          const pois = await getNearbyPois(lat, lng, r, "interesting", language === "he" ? "he" : "en");
-          best = await pickBestPoiForUser(pois, lat, lng, userKey, language);
-          if (best) break;
-        }
-
-        if (best && best.chosen) {
-          const poi = best.chosen;
-          const distRounded = Math.round(best.distanceMeters ?? 0);
-
-          chosenPoiId = poi.id;
-          sources = Array.isArray(best.sources) ? best.sources : [];
-
-          // keep city safe: do not inject city here unless you have it
-          const placeName = poi.name ? `"${poi.name}"` : `"nearby point"`;
-
-          poiLine = `Nearby point of interest (distance about ${distRounded} meters): ${placeName}. Use this as the main focus.`;
-
-          const facts = Array.isArray(best.facts) ? best.facts : [];
-          if (facts.length > 0) {
-            const lines = facts.slice(0, 5).map((f, i) => `FACT ${i + 1}: ${f}`);
-            factsBlock = `FACTS:\n${lines.join("\n")}`;
-          }
-        }
-      } catch (e) {
-        console.error("Failed to fetch POIs for story-both:", e);
-      }
-    }
-
-    // If we have no facts, we prefer silence
-    if (!factsBlock) {
+    if (typeof lat !== "number" || typeof lng !== "number") {
       return res.json({
         shouldSpeak: false,
-        reason: "no_strong_poi_or_facts",
+        reason: "location_missing",
         language,
       });
     }
 
-    const systemMessage = getSystemMessage(language);
+    // Find best POI with expanding radii
+    const radii = [400, 800, 1500];
+    let best = null;
 
-    const userMessage = `${locationLine}
-${poiLine ? poiLine + "\n" : ""}${factsBlock}
-User request: ${prompt}`;
+    for (const r of radii) {
+      const pois = await getNearbyPois(lat, lng, r, "interesting", language === "he" ? "he" : "en");
+      best = await pickBestPoiForUser(pois, lat, lng, userKey, language);
+      if (best) break;
+    }
+
+    if (!best || !best.chosen) {
+      return res.json({
+        shouldSpeak: false,
+        reason: "no_strong_poi",
+        language,
+      });
+    }
+
+    const poi = best.chosen;
+    const distRounded = Math.round(best.distanceMeters ?? 0);
+
+    const poiLine = `Nearby point of interest (distance about ${distRounded} meters): "${poi.name}".`;
+    const facts = Array.isArray(best.facts) ? best.facts : [];
+    const factsLines = facts.slice(0, 5).map((f, i) => `FACT ${i + 1}: ${f}`);
+
+    if (factsLines.length < 2) {
+      return res.json({
+        shouldSpeak: false,
+        reason: "facts_too_thin",
+        language,
+      });
+    }
+
+    const userMessage = `
+${poiLine}
+FACTS:
+${factsLines.join("\n")}
+User request: ${prompt}
+`.trim();
 
     const completion = await openai.chat.completions.create({
       model: "gpt-4.1-mini",
       messages: [
-        { role: "system", content: systemMessage },
+        { role: "system", content: getSystemMessage(language) },
         { role: "user", content: userMessage },
       ],
       temperature: 0.4,
@@ -846,17 +845,16 @@ User request: ${prompt}`;
     if (storyText === "NO_STORY") {
       return res.json({
         shouldSpeak: false,
-        reason: "model_refused_due_to_thin_facts",
+        reason: "model_no_story",
         language,
       });
     }
 
-    const { audioBase64, voiceId, voiceIndex, voiceKey } = await ttsWithOpenAI(storyText, language);
+    const { audioBase64, voiceId, voiceIndex, voiceKey } =
+      await ttsWithOpenAI(storyText, language);
 
-    // Mark as heard only if we actually spoke
-    if (chosenPoiId) {
-      await markPlaceHeardForUser(userKey, chosenPoiId);
-    }
+    // Mark as heard only if we spoke
+    await markPlaceHeardForUser(userKey, poi.id);
 
     res.json({
       shouldSpeak: true,
@@ -866,7 +864,10 @@ User request: ${prompt}`;
       voiceIndex,
       voiceKey,
       language,
-      sources, // for debug, not spoken
+      poiId: poi.id,
+      poiName: poi.name,
+      poiSource: poi.source,
+      sources: Array.isArray(best.sources) ? best.sources : [],
     });
   } catch (err) {
     console.error("Error in /api/story-both:", err);
@@ -874,15 +875,17 @@ User request: ${prompt}`;
   }
 });
 
-// health
+// Health
 app.get("/health", (req, res) => {
   res.json({
     status: "ok",
-    build: "btw-interesting-osm-wikidata-quality-gate-v1",
+    build: "btw-osm-wikidata-quality-gate-v1",
   });
 });
 
-initDb().catch((err) => console.error("DB init failed:", err));
+initDb().catch((err) => {
+  console.error("DB init failed:", err);
+});
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, "0.0.0.0", () => {
