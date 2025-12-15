@@ -16,9 +16,7 @@ if (!GOOGLE_PLACES_API_KEY) {
   console.warn("⚠️ GOOGLE_PLACES_API_KEY is missing in env");
 }
 if (!DATABASE_URL) {
-  console.warn(
-    "⚠️ DATABASE_URL is missing - using in memory only, no persistent DB"
-  );
+  console.warn("⚠️ DATABASE_URL is missing - using in memory only, no persistent DB");
 }
 
 // Pool for Postgres if DATABASE_URL exists (Render SSL)
@@ -58,13 +56,13 @@ async function ttsWithOpenAI(text, language = "he") {
   const { voiceName, voiceIndex, voiceKey } = pickVoice(language);
 
   const instructions =
-    "Speak in the same language as the input text with a very natural, lively storyteller style. " +
-    "Use a medium-to-fast pace: clearly faster than a slow audiobook, but never rushed or messy. " +
-    "Avoid monotone: vary your pitch and energy, especially before and during funny or surprising parts. " +
-    "Make short, clear pauses at commas and full stops, as if you take a quick breath. " +
-    "Build tension before punchlines by slightly raising your tone and energy, then relax after the joke. " +
-    "Sound like a great stand up comedian telling a short, warm story to a driver: funny, curious, playful, " +
-    "but always easy to understand and not over-the-top.";
+    "Speak in the same language as the input text. " +
+    "Sound like a friendly, smart human narrator riding with the driver. " +
+    "Add more natural breathing and micro-pauses: short breaths between clauses, and slightly longer pauses after full stops. " +
+    "Use a warm smile in your tone (audible but subtle), and keep your energy varied so it never sounds monotone. " +
+    "Before a punchline or surprising fact: slow down a little, pause briefly, then deliver it with a light playful lift. " +
+    "Do not shout. Keep it clear and safe for driving. " +
+    "Avoid overly dramatic acting; aim for natural, conversational storytelling.";
 
   const response = await openai.audio.speech.create({
     model: "gpt-4o-mini-tts",
@@ -87,12 +85,24 @@ async function ttsWithOpenAI(text, language = "he") {
 
 const placesCacheMemory = new Map(); // cache_key => pois[]
 const userPlacesHistoryMemory = new Map(); // userKey => Set(placeId)
-const wikidataFactsMemory = new Map(); // qid|lang => { facts, sources }
+const wikidataFactsMemory = new Map(); // qid|lang => { facts, sources, meta }
 
 function makeCacheKey(lat, lng, radiusMeters, mode = "interesting", language = "en") {
   const latKey = lat.toFixed(4);
   const lngKey = lng.toFixed(4);
   return `${mode}:${language}:${latKey},${lngKey},${radiusMeters}`;
+}
+
+// ===== Human distance formatting =====
+function roundToNearest(n, step) {
+  return Math.round(n / step) * step;
+}
+
+function approxDistanceMeters(distanceMeters, stepMeters = 50) {
+  if (!Number.isFinite(distanceMeters)) return null;
+  const d = Math.max(0, distanceMeters);
+  const step = Math.max(10, stepMeters);
+  return roundToNearest(d, step);
 }
 
 async function initDb() {
@@ -269,9 +279,9 @@ async function fetchNearbyPlacesFromGoogle(lat, lng, radiusMeters = 800) {
 const OVERPASS_URL = "https://overpass-api.de/api/interpreter";
 
 function overpassQuery(lat, lng, radiusMeters) {
-  // Non-business POI focus: historic, tourism attractions/viewpoints, memorials, natural
+  // Non-business POI focus
   return `
-[out:json][timeout:12];
+[out:json][timeout:18];
 (
   node(around:${radiusMeters},${lat},${lng})[historic];
   way(around:${radiusMeters},${lat},${lng})[historic];
@@ -293,7 +303,7 @@ function overpassQuery(lat, lng, radiusMeters) {
   way(around:${radiusMeters},${lat},${lng})[natural];
   relation(around:${radiusMeters},${lat},${lng})[natural];
 );
-out center tags 60;
+out center tags 80;
 `.trim();
 }
 
@@ -303,6 +313,16 @@ function safeTag(tags, key) {
   return typeof v === "string" ? v : "";
 }
 
+function nameFromWikipediaTag(wikipediaTag) {
+  // e.g. "he:הטכניון" or "en:Some_Title"
+  if (typeof wikipediaTag !== "string") return "";
+  const parts = wikipediaTag.split(":");
+  if (parts.length >= 2) {
+    return parts.slice(1).join(":").replaceAll("_", " ").trim();
+  }
+  return wikipediaTag.replaceAll("_", " ").trim();
+}
+
 function bestNameFromOsm(tags) {
   const n = safeTag(tags, "name");
   if (n) return n;
@@ -310,6 +330,10 @@ function bestNameFromOsm(tags) {
   if (he) return he;
   const en = safeTag(tags, "name:en");
   if (en) return en;
+
+  const wikipedia = safeTag(tags, "wikipedia");
+  if (wikipedia) return nameFromWikipediaTag(wikipedia);
+
   return "";
 }
 
@@ -332,8 +356,8 @@ function osmElementToPoi(el) {
   if (typeof lat !== "number" || typeof lng !== "number") return null;
 
   const wikidataId = safeTag(tags, "wikidata") || null;
+  const wikipedia = safeTag(tags, "wikipedia") || null;
 
-  // keep a short "kind" hint
   const kind =
     safeTag(tags, "historic") ||
     safeTag(tags, "tourism") ||
@@ -351,6 +375,7 @@ function osmElementToPoi(el) {
     address: "",
     source: "osm",
     wikidataId,
+    wikipedia,
     osmTags: tags,
   };
 }
@@ -364,11 +389,11 @@ async function fetchNearbyPoisFromOSM(lat, lng, radiusMeters = 800) {
       method: "POST",
       headers: {
         "Content-Type": "text/plain; charset=utf-8",
-        "User-Agent": "on-the-road-server/1.0",
+        "User-Agent": "btw-ontheroad-server/1.0 (contact: none)",
       },
       body: q,
     },
-    9000
+    12000
   );
 
   if (!resp.ok) {
@@ -385,13 +410,13 @@ async function fetchNearbyPoisFromOSM(lat, lng, radiusMeters = 800) {
     const poi = osmElementToPoi(el);
     if (!poi) continue;
 
-    // must have a name or wikidata id
-    if (!poi.name && !poi.wikidataId) continue;
+    // Keep if it has a name OR wikidata OR wikipedia
+    if (!poi.name && !poi.wikidataId && !poi.wikipedia) continue;
 
     pois.push(poi);
   }
 
-  return pois.slice(0, 30);
+  return pois.slice(0, 40);
 }
 
 // ===== Source 3: Wikidata around via SPARQL =====
@@ -417,7 +442,7 @@ SELECT ?item ?itemLabel ?itemDescription ?lat ?lon WHERE {
   BIND(geof:longitude(?location) AS ?lon)
   SERVICE wikibase:label { bd:serviceParam wikibase:language "${language},he,en". }
 }
-LIMIT 25
+LIMIT 35
 `.trim();
 
   const url = `${WIKIDATA_SPARQL}?format=json&query=${encodeURIComponent(query)}`;
@@ -428,10 +453,10 @@ LIMIT 25
       method: "GET",
       headers: {
         "Accept": "application/sparql-results+json",
-        "User-Agent": "on-the-road-server/1.0",
+        "User-Agent": "btw-ontheroad-server/1.0 (contact: none)",
       },
     },
-    9000
+    12000
   );
 
   if (!resp.ok) {
@@ -473,21 +498,30 @@ LIMIT 25
   return pois;
 }
 
-// ===== Wikidata facts (light) =====
+// ===== Wikidata facts pack (stronger) =====
+function toYearString(x) {
+  if (!x) return "";
+  if (typeof x === "string") return x;
+  return String(x);
+}
+
 async function fetchWikidataFacts(qid, language = "en") {
-  if (!qid) return { facts: [], sources: [] };
+  if (!qid) return { facts: [], sources: [], meta: {} };
 
   const cacheKey = `${qid}|${language}`;
   const cached = wikidataFactsMemory.get(cacheKey);
   if (cached) return cached;
 
+  // Pull: instance, description, inception year, named after, architect, heritage designation, significant event
   const query = `
-SELECT ?itemLabel ?itemDescription ?inceptionLabel ?namedAfterLabel ?architectLabel ?instanceLabel WHERE {
+SELECT ?itemLabel ?itemDescription ?instanceLabel ?inceptionYear ?namedAfter ?namedAfterLabel ?architectLabel ?heritageLabel ?eventLabel WHERE {
   BIND(wd:${qid} AS ?item)
-  OPTIONAL { ?item wdt:P571 ?inception . }
+  OPTIONAL { ?item wdt:P31 ?instance . }
+  OPTIONAL { ?item wdt:P571 ?inception . BIND(YEAR(?inception) AS ?inceptionYear) }
   OPTIONAL { ?item wdt:P138 ?namedAfter . }
   OPTIONAL { ?item wdt:P84 ?architect . }
-  OPTIONAL { ?item wdt:P31 ?instance . }
+  OPTIONAL { ?item wdt:P1435 ?heritage . }
+  OPTIONAL { ?item wdt:P793 ?event . }
   SERVICE wikibase:label { bd:serviceParam wikibase:language "${language},he,en". }
 }
 LIMIT 1
@@ -502,44 +536,122 @@ LIMIT 1
         method: "GET",
         headers: {
           "Accept": "application/sparql-results+json",
-          "User-Agent": "on-the-road-server/1.0",
+          "User-Agent": "btw-ontheroad-server/1.0 (contact: none)",
         },
       },
-      9000
+      12000
     );
 
     if (!resp.ok) {
       const text = await resp.text();
       console.error("Wikidata facts error:", resp.status, text.slice(0, 400));
-      return { facts: [], sources: [] };
+      return { facts: [], sources: [], meta: {} };
     }
 
     const data = await resp.json();
     const b = data?.results?.bindings?.[0];
-    if (!b) return { facts: [], sources: [] };
+    if (!b) return { facts: [], sources: [], meta: {} };
 
     const desc = b.itemDescription?.value || "";
     const instance = b.instanceLabel?.value || "";
-    const inception = b.inceptionLabel?.value || "";
-    const namedAfter = b.namedAfterLabel?.value || "";
+    const inceptionYear = b.inceptionYear?.value || "";
+    const namedAfterLabel = b.namedAfterLabel?.value || "";
+    const namedAfterQid = qidFromEntityUrl(b.namedAfter?.value) || "";
     const architect = b.architectLabel?.value || "";
+    const heritage = b.heritageLabel?.value || "";
+    const event = b.eventLabel?.value || "";
 
     const facts = [];
-    if (instance) facts.push(`Type: ${instance}.`);
+    const meta = {
+      hasInstance: !!instance,
+      hasDesc: !!desc,
+      hasInception: !!inceptionYear,
+      hasNamedAfter: !!namedAfterLabel,
+      hasArchitect: !!architect,
+      hasHeritage: !!heritage,
+      hasEvent: !!event,
+      namedAfterQid: namedAfterQid || null,
+    };
+
+    if (instance) facts.push(`Instance of: ${instance}.`);
     if (desc) facts.push(`Description: ${desc}.`);
-    if (inception) facts.push(`Inception: ${inception}.`);
-    if (namedAfter) facts.push(`Named after: ${namedAfter}.`);
+    if (inceptionYear) facts.push(`Inception year: ${toYearString(inceptionYear)}.`);
+    if (namedAfterLabel) facts.push(`Named after: ${namedAfterLabel}.`);
     if (architect) facts.push(`Architect: ${architect}.`);
+    if (heritage) facts.push(`Heritage designation: ${heritage}.`);
+    if (event) facts.push(`Significant event: ${event}.`);
 
     const sources = [
       { type: "wikidata", qid, url: `https://www.wikidata.org/wiki/${qid}` },
     ];
 
-    const result = { facts: facts.slice(0, 5), sources };
+    const result = { facts: facts.slice(0, 8), sources, meta };
     wikidataFactsMemory.set(cacheKey, result);
     return result;
   } catch (e) {
     console.error("Wikidata facts fetch failed:", e);
+    return { facts: [], sources: [], meta: {} };
+  }
+}
+
+async function fetchPersonFacts(personQid, language = "en") {
+  if (!personQid) return { facts: [], sources: [] };
+
+  const cacheKey = `person:${personQid}|${language}`;
+  const cached = wikidataFactsMemory.get(cacheKey);
+  if (cached) return cached;
+
+  const query = `
+SELECT ?personLabel ?occupationLabel ?birthYear ?deathYear WHERE {
+  BIND(wd:${personQid} AS ?person)
+  OPTIONAL { ?person wdt:P106 ?occupation . }
+  OPTIONAL { ?person wdt:P569 ?birth . BIND(YEAR(?birth) AS ?birthYear) }
+  OPTIONAL { ?person wdt:P570 ?death . BIND(YEAR(?death) AS ?deathYear) }
+  SERVICE wikibase:label { bd:serviceParam wikibase:language "${language},he,en". }
+}
+LIMIT 1
+`.trim();
+
+  const url = `${WIKIDATA_SPARQL}?format=json&query=${encodeURIComponent(query)}`;
+
+  try {
+    const resp = await abortableFetch(
+      url,
+      {
+        method: "GET",
+        headers: {
+          "Accept": "application/sparql-results+json",
+          "User-Agent": "btw-ontheroad-server/1.0 (contact: none)",
+        },
+      },
+      12000
+    );
+
+    if (!resp.ok) return { facts: [], sources: [] };
+
+    const data = await resp.json();
+    const b = data?.results?.bindings?.[0];
+    if (!b) return { facts: [], sources: [] };
+
+    const personLabel = b.personLabel?.value || "";
+    const occupation = b.occupationLabel?.value || "";
+    const birthYear = b.birthYear?.value || "";
+    const deathYear = b.deathYear?.value || "";
+
+    const facts = [];
+    if (personLabel) facts.push(`Person: ${personLabel}.`);
+    if (occupation) facts.push(`Occupation: ${occupation}.`);
+    if (birthYear && deathYear) facts.push(`Lifespan: ${birthYear}-${deathYear}.`);
+    else if (birthYear) facts.push(`Birth year: ${birthYear}.`);
+
+    const sources = [
+      { type: "wikidata", qid: personQid, url: `https://www.wikidata.org/wiki/${personQid}` },
+    ];
+
+    const result = { facts: facts.slice(0, 4), sources };
+    wikidataFactsMemory.set(cacheKey, result);
+    return result;
+  } catch {
     return { facts: [], sources: [] };
   }
 }
@@ -578,11 +690,10 @@ async function getNearbyPois(lat, lng, radiusMeters = 800, mode = "interesting",
     if (osmRes.status === "fulfilled") pois = pois.concat(osmRes.value);
     if (wdRes.status === "fulfilled") pois = pois.concat(wdRes.value);
 
-    // fallback to Google only if no results
     if (pois.length === 0) {
       try {
         pois = await fetchNearbyPlacesFromGoogle(lat, lng, radiusMeters);
-      } catch (e) {
+      } catch {
         // ignore
       }
     }
@@ -624,18 +735,48 @@ async function getNearbyPois(lat, lng, radiusMeters = 800, mode = "interesting",
   return deduped;
 }
 
-// ===== Picking logic with quality gate =====
+// ===== Picking logic: prefer "fact density" over raw distance =====
+function computeFactScore(distanceM, factsMeta, factsCount) {
+  const d = Number.isFinite(distanceM) ? distanceM : 999999;
+
+  // Base: closer is better
+  let score = d;
+
+  // Strong preference for items with concrete anchors
+  if (factsMeta?.hasNamedAfter) score -= 650;
+  if (factsMeta?.hasInception) score -= 350;
+  if (factsMeta?.hasEvent) score -= 650;
+  if (factsMeta?.hasHeritage) score -= 450;
+  if (factsMeta?.hasArchitect) score -= 250;
+
+  // More facts => better
+  score -= Math.min(6, Math.max(0, factsCount)) * 120;
+
+  return score;
+}
+
+function countHardAnchors(factsMeta) {
+  let n = 0;
+  if (factsMeta?.hasNamedAfter) n += 1;
+  if (factsMeta?.hasInception) n += 1;
+  if (factsMeta?.hasEvent) n += 1;
+  if (factsMeta?.hasHeritage) n += 1;
+  return n;
+}
+
 async function pickBestPoiForUser(pois, lat, lng, userKey, language) {
   if (!pois || pois.length === 0) return null;
 
   const heardSet = await getHeardSetForUser(userKey);
+  const lang = language === "he" ? "he" : "en";
 
-  const candidates = [];
+  // Start with nearby + unseen candidates
+  const raw = [];
   for (const p of pois) {
     if (typeof p.lat !== "number" || typeof p.lng !== "number") continue;
 
     const d = distanceMeters(lat, lng, p.lat, p.lng);
-    if (d > 1500) continue;
+    if (d > 2000) continue;
 
     if (heardSet.has(p.id)) continue;
 
@@ -645,99 +786,124 @@ async function pickBestPoiForUser(pois, lat, lng, userKey, language) {
         ? p.id.replace("wd:", "")
         : null);
 
-    const hasFactsHook = !!qid;
-    const bonus = hasFactsHook ? 250 : 0; // prefer items with facts
-    const score = d - bonus;
-
-    candidates.push({ p, d, score, qid });
+    raw.push({ p, d, qid });
   }
 
-  candidates.sort((a, b) => a.score - b.score);
+  // Sort by distance first, then we enrich facts for top ones
+  raw.sort((a, b) => a.d - b.d);
 
-  const lang = language === "he" ? "he" : "en";
-
-  for (const c of candidates.slice(0, 12)) {
+  const enriched = [];
+  for (const c of raw.slice(0, 16)) {
     const qid = c.qid;
     let facts = [];
     let sources = [];
+    let meta = {};
 
     if (qid) {
       const r = await fetchWikidataFacts(qid, lang);
-      facts = r.facts;
-      sources = r.sources;
+      facts = r.facts || [];
+      sources = r.sources || [];
+      meta = r.meta || {};
+
+      // If we have "named after", pull basic person facts too
+      if (meta.namedAfterQid) {
+        const pr = await fetchPersonFacts(meta.namedAfterQid, lang);
+        if (Array.isArray(pr.facts) && pr.facts.length > 0) {
+          facts = facts.concat(pr.facts);
+          sources = sources.concat(pr.sources || []);
+        }
+      }
     } else if (typeof c.p.description === "string" && c.p.description.trim().length > 0) {
       facts = [`Description: ${c.p.description.trim()}.`];
       sources = [];
+      meta = { hasDesc: true };
     }
 
-    // Quality gate: at least 2 factual lines OR 1 strong description line (long enough)
-    const descOk =
-      facts.length >= 2 ||
-      (facts.length === 1 && facts[0].length >= 50);
+    const hardAnchors = countHardAnchors(meta);
+    const factsCount = facts.length;
 
-    if (descOk) {
-      return {
-        chosen: c.p,
-        distanceMeters: c.d,
-        facts,
-        sources,
-        qid,
-      };
-    }
+    // Quality gate: at least 4 facts AND at least 2 hard anchors
+    const ok = factsCount >= 4 && hardAnchors >= 2;
+
+    if (!ok) continue;
+
+    const score = computeFactScore(c.d, meta, factsCount);
+
+    enriched.push({
+      p: c.p,
+      d: c.d,
+      qid,
+      facts: facts.slice(0, 9),
+      sources,
+      meta,
+      score,
+    });
   }
 
-  return null;
+  if (enriched.length === 0) return null;
+
+  enriched.sort((a, b) => a.score - b.score);
+  return enriched[0];
 }
 
-// ===== System message: enforce no hallucination =====
+// ===== System message: facts only, no hype, no opinions =====
 function getSystemMessage(language) {
   if (language === "en") {
     return `
-You are the storyteller voice of a driving app.
+You are a factual narrator for a driving app.
 
 Truth rules:
 - Use ONLY the facts provided under FACTS.
 - If a detail is not in FACTS, do not state it as fact.
-- If FACTS are too thin, return exactly: NO_STORY
+- No hype, no opinions, no superlatives. Avoid adjectives like "beautiful", "amazing", "famous", "vibrant".
+- Each sentence must contain at least one concrete fact (a name, year, number, title, designation, or the distance).
+- Avoid graphic violence or sexual content. Keep it safe for teens.
 
-Style:
-- Short, witty, surprising, but factual and deep.
-- Exactly one paragraph, 40 to 70 words.
-- No greetings.
-- Start immediately with the most interesting fact.
+Output rules:
+- Exactly one paragraph.
+- 45 to 80 words.
+- No greeting.
+- Use commas and occasional ellipses to help natural speech.
+- Start immediately with the strongest fact.
 `.trim();
   }
 
   if (language === "fr") {
     return `
-Tu es la voix d'un conteur pour une application de conduite.
+Tu es un narrateur factuel pour une application de conduite.
 
 Règles de vérité:
-- Utilise UNIQUEMENT les faits fournis sous FACTS.
+- Utilise UNIQUEMENT les faits sous FACTS.
 - Si ce n'est pas dans FACTS, ne l'affirme pas.
-- Si FACTS est trop pauvre, réponds exactement: NO_STORY
+- Zéro hype, zéro opinion, pas de superlatifs. Évite "magnifique", "incroyable", "célèbre", etc.
+- Chaque phrase doit contenir au moins un fait concret (nom, année, nombre, titre, désignation, ou la distance).
+- Évite la violence graphique et le contenu sexuel. Reste safe pour des ados.
 
-Style:
-- Court, surprenant, avec une touche d'humour, mais factuel et un peu profond.
-- Un seul paragraphe, 40 à 70 mots.
-- Pas de salutations.
-- Commence directement par le fait le plus intéressant.
+Règles de sortie:
+- Un seul paragraphe.
+- 45 à 80 mots.
+- Pas de salutation.
+- Utilise des virgules et parfois des points de suspension (...) pour aider la voix.
+- Commence directement par le fait le plus fort.
 `.trim();
   }
 
   return `
-אתה הקריין של אפליקציית נהיגה.
+אתה קריין עובדתי לאפליקציית נהיגה.
 
 חוקי אמת:
 - אתה משתמש רק בעובדות שניתנו לך תחת FACTS.
 - אם פרט לא נמצא ב-FACTS אסור לך להציג אותו כעובדה.
-- אם FACTS דל מדי, אתה מחזיר בדיוק: NO_STORY
+- אפס סופרלטיבים, אפס דעות, אפס "מדהים/יפה/מפורסם". לא להשתמש בתיאורי רושם.
+- כל משפט חייב לכלול לפחות עובדה קונקרטית אחת (שם, שנה, מספר, תפקיד, סטטוס, או המרחק).
+- לא להכניס אלימות גרפית או תוכן מיני. זה חייב להיות בטוח לבני נוער.
 
-סגנון:
-- קצר, שנון, מפתיע, אבל מדויק ועם עומק.
-- פסקה אחת בלבד, 40 עד 70 מילים.
+חוקי פלט:
+- פסקה אחת בלבד.
+- 45 עד 80 מילים.
 - בלי ברכות פתיחה.
-- להתחיל ישר בעובדה הכי מעניינת.
+- להשתמש בפסיקים ולעיתים בשלוש נקודות (...) כדי לעזור לקריינות אנושית.
+- להתחיל ישר בעובדה הכי חזקה.
 `.trim();
 }
 
@@ -747,9 +913,7 @@ app.get("/places", async (req, res) => {
     const { lat, lng, radius, mode, language } = req.query;
 
     if (!lat || !lng) {
-      return res
-        .status(400)
-        .json({ error: "lat and lng query params are required" });
+      return res.status(400).json({ error: "lat and lng query params are required" });
     }
 
     const radiusMeters = radius ? Number(radius) : 800;
@@ -771,9 +935,7 @@ app.post("/api/story-both", async (req, res) => {
     let { language } = req.body;
 
     if (!prompt || typeof prompt !== "string") {
-      return res
-        .status(400)
-        .json({ error: "Missing 'prompt' in request body (string required)" });
+      return res.status(400).json({ error: "Missing 'prompt' in request body (string required)" });
     }
 
     if (!language || typeof language !== "string") language = "he";
@@ -783,15 +945,11 @@ app.post("/api/story-both", async (req, res) => {
     const userKey = getUserKeyFromRequest(req);
 
     if (typeof lat !== "number" || typeof lng !== "number") {
-      return res.json({
-        shouldSpeak: false,
-        reason: "location_missing",
-        language,
-      });
+      return res.json({ shouldSpeak: false, reason: "location_missing", language });
     }
 
-    // Find best POI with expanding radii
-    const radii = [400, 800, 1500];
+    // Expanding radii
+    const radii = [400, 800, 1500, 2200];
     let best = null;
 
     for (const r of radii) {
@@ -800,28 +958,23 @@ app.post("/api/story-both", async (req, res) => {
       if (best) break;
     }
 
-    if (!best || !best.chosen) {
-      return res.json({
-        shouldSpeak: false,
-        reason: "no_strong_poi",
-        language,
-      });
+    if (!best || !best.p) {
+      return res.json({ shouldSpeak: false, reason: "no_strong_poi", language });
     }
 
-    const poi = best.chosen;
-    const distRounded = Math.round(best.distanceMeters ?? 0);
+    const poi = best.p;
+    const distExact = best.d;
+    const distApprox = approxDistanceMeters(distExact, 50); // user chose 50m rounding
+    const distText = distApprox != null ? `${distApprox}` : `${Math.round(distExact)}`;
 
-    const poiLine = `Nearby point of interest (distance about ${distRounded} meters): "${poi.name}".`;
+    // Facts pack for model (facts-only)
     const facts = Array.isArray(best.facts) ? best.facts : [];
-    const factsLines = facts.slice(0, 5).map((f, i) => `FACT ${i + 1}: ${f}`);
+    const factsLines = facts.slice(0, 9).map((f, i) => `FACT ${i + 1}: ${f}`);
 
-    if (factsLines.length < 2) {
-      return res.json({
-        shouldSpeak: false,
-        reason: "facts_too_thin",
-        language,
-      });
-    }
+    // Add distance as a fact (rounded)
+    factsLines.unshift(`FACT 0: Distance from the driver: about ${distText} meters.`);
+
+    const poiLine = `Point of interest: "${poi.name}".`;
 
     const userMessage = `
 ${poiLine}
@@ -836,24 +989,17 @@ User request: ${prompt}
         { role: "system", content: getSystemMessage(language) },
         { role: "user", content: userMessage },
       ],
-      temperature: 0.4,
+      temperature: 0.35,
     });
 
     const storyText = completion.choices[0]?.message?.content?.trim();
     if (!storyText) throw new Error("No story generated by OpenAI");
-
     if (storyText === "NO_STORY") {
-      return res.json({
-        shouldSpeak: false,
-        reason: "model_no_story",
-        language,
-      });
+      return res.json({ shouldSpeak: false, reason: "model_no_story", language });
     }
 
-    const { audioBase64, voiceId, voiceIndex, voiceKey } =
-      await ttsWithOpenAI(storyText, language);
+    const { audioBase64, voiceId, voiceIndex, voiceKey } = await ttsWithOpenAI(storyText, language);
 
-    // Mark as heard only if we spoke
     await markPlaceHeardForUser(userKey, poi.id);
 
     res.json({
@@ -867,6 +1013,7 @@ User request: ${prompt}
       poiId: poi.id,
       poiName: poi.name,
       poiSource: poi.source,
+      distanceMetersApprox: distApprox,
       sources: Array.isArray(best.sources) ? best.sources : [],
     });
   } catch (err) {
@@ -879,7 +1026,7 @@ User request: ${prompt}
 app.get("/health", (req, res) => {
   res.json({
     status: "ok",
-    build: "btw-osm-wikidata-quality-gate-v1",
+    build: "btw-facts-only-round50-better-tts-v1",
   });
 });
 
