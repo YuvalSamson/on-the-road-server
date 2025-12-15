@@ -1,5 +1,3 @@
-// server.js
-
 import express from "express";
 import cors from "cors";
 import bodyParser from "body-parser";
@@ -9,41 +7,36 @@ import pkg from "pg";
 
 const { Pool } = pkg;
 
-dotenv.config(); // טוען את .env
+dotenv.config();
 
 const GOOGLE_PLACES_API_KEY = process.env.GOOGLE_PLACES_API_KEY;
 const DATABASE_URL = process.env.DATABASE_URL;
 
 if (!GOOGLE_PLACES_API_KEY) {
-  console.warn("⚠️ GOOGLE_PLACES_API_KEY is missing in .env");
+  console.warn("⚠️ GOOGLE_PLACES_API_KEY is missing in env");
 }
 if (!DATABASE_URL) {
   console.warn("⚠️ DATABASE_URL is missing - using in memory only, no persistent DB");
 }
 
-// Pool ל-Postgres אם יש DATABASE_URL, עם SSL ל-Render
+// Postgres pool
 let pool = null;
 if (DATABASE_URL) {
   pool = new Pool({
     connectionString: DATABASE_URL,
-    ssl: {
-      rejectUnauthorized: false,
-    },
+    ssl: { rejectUnauthorized: false },
   });
 }
 
-// אפליקציה
+// App
 const app = express();
 app.use(cors());
 app.use(bodyParser.json());
 
-// 1. OpenAI client - גם לטקסט וגם ל-TTS
-const openai = new OpenAI({
-  apiKey: process.env.OPENAI_API_KEY,
-});
+// OpenAI
+const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
-// 2. קולות TTS
-// בעברית - כרגע nova, בשאר שפות רנדומלי מתוך כמה קולות
+// TTS voices
 const TTS_VOICES_NON_HE = ["alloy", "fable", "shimmer"];
 
 function pickVoice(language) {
@@ -61,7 +54,6 @@ function pickVoice(language) {
   return { voiceName, voiceIndex, voiceKey };
 }
 
-// 3. TTS בעזרת OpenAI - מחזיר base64 + מידע על הקול, עם הוראות אינטונציה
 async function ttsWithOpenAI(text, language = "he") {
   const { voiceName, voiceIndex, voiceKey } = pickVoice(language);
 
@@ -83,31 +75,30 @@ async function ttsWithOpenAI(text, language = "he") {
 
   const buffer = Buffer.from(await response.arrayBuffer());
   const audioBase64 = buffer.toString("base64");
-
   const voiceId = `gpt-4o-mini-tts:${voiceName}`;
 
   return { audioBase64, voiceId, voiceIndex, voiceKey };
 }
 
 /**
- * ===== "דאטאבייס" + cache =====
- * 1. places_cache - נשמר ב-Postgres, בנוסף ל-cache בזיכרון
- * 2. user_place_history - היסטוריית מקומות ברמת יוזר
+ * ===== DB + cache =====
+ * places_cache: cache JSON by cache_key
+ * user_place_history: per-user history of POI ids (we store generic poi_id strings)
  */
 
-// cache בזיכרון לתוצאות Google Places
-const placesCacheMemory = new Map(); // key: "lat,lng,radius" => value: places[]
+// in-memory cache
+const placesCacheMemory = new Map(); // key => array
+const userPlacesHistoryMemory = new Map(); // userKey => Set(poiId)
 
-// cache בזיכרון להיסטוריית מקומות פר-יוזר
-const userPlacesHistoryMemory = new Map(); // key: userKey => Set(placeId)
+// extra cache for wikidata facts
+const wikidataFactsMemory = new Map(); // qid|lang => { facts:[], sources:[] }
 
-function makePlacesCacheKey(lat, lng, radiusMeters) {
+function makePlacesCacheKey(lat, lng, radiusMeters, mode = "mixed") {
   const latKey = lat.toFixed(4);
   const lngKey = lng.toFixed(4);
-  return `${latKey},${lngKey},${radiusMeters}`;
+  return `${mode}:${latKey},${lngKey},${radiusMeters}`;
 }
 
-// אתחול DB - יצירת טבלאות אם צריך
 async function initDb() {
   if (!pool) {
     console.warn("DB init skipped - no DATABASE_URL");
@@ -137,9 +128,6 @@ async function initDb() {
   }
 }
 
-// הפקת מזהה יוזר מהבקשה:
-// 1. אם יש header בשם x-user-id - משתמשים בו
-// 2. אחרת IP / anon
 function getUserKeyFromRequest(req) {
   const headerId = req.headers["x-user-id"];
   if (typeof headerId === "string" && headerId.trim() !== "") {
@@ -152,14 +140,10 @@ function getUserKeyFromRequest(req) {
   }
 
   const ip = typeof req.ip === "string" && req.ip ? req.ip : null;
-  if (ip) {
-    return `ip:${ip}`;
-  }
-
+  if (ip) return `ip:${ip}`;
   return "anon";
 }
 
-// החזרת Set של place_id שיוזר כבר שמע
 async function getHeardSetForUser(userKey) {
   let set = userPlacesHistoryMemory.get(userKey);
   if (set) return set;
@@ -184,7 +168,6 @@ async function getHeardSetForUser(userKey) {
   return set;
 }
 
-// סימון מקום כיוזר כבר שמע עליו
 async function markPlaceHeardForUser(userKey, placeId) {
   if (!placeId) return;
 
@@ -199,7 +182,7 @@ async function markPlaceHeardForUser(userKey, placeId) {
       INSERT INTO user_place_history (user_key, place_id)
       VALUES ($1, $2)
       ON CONFLICT (user_key, place_id) DO NOTHING
-    `,
+      `,
       [userKey, placeId]
     );
   } catch (err) {
@@ -207,7 +190,25 @@ async function markPlaceHeardForUser(userKey, placeId) {
   }
 }
 
-// 4. Google Places - קריאה אמיתית ל-Google
+// distance meters
+function distanceMeters(lat1, lng1, lat2, lng2) {
+  const R = 6371000;
+  const toRad = (deg) => (deg * Math.PI) / 180;
+  const dLat = toRad(lat2 - lat1);
+  const dLng = toRad(lng2 - lng1);
+
+  const a =
+    Math.sin(dLat / 2) * Math.sin(dLat / 2) +
+    Math.cos(toRad(lat1)) *
+      Math.cos(toRad(lat2)) *
+      Math.sin(dLng / 2) *
+      Math.sin(dLng / 2);
+
+  const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+  return R * c;
+}
+
+// ===== Google Places (kept as fallback) =====
 async function fetchNearbyPlacesFromGoogle(lat, lng, radiusMeters = 800) {
   if (!GOOGLE_PLACES_API_KEY) {
     throw new Error("GOOGLE_PLACES_API_KEY is not configured");
@@ -218,10 +219,7 @@ async function fetchNearbyPlacesFromGoogle(lat, lng, radiusMeters = 800) {
   const body = {
     locationRestriction: {
       circle: {
-        center: {
-          latitude: lat,
-          longitude: lng,
-        },
+        center: { latitude: lat, longitude: lng },
         radius: radiusMeters,
       },
     },
@@ -248,21 +246,308 @@ async function fetchNearbyPlacesFromGoogle(lat, lng, radiusMeters = 800) {
   const data = await resp.json();
 
   const places = (data.places || []).map((p) => ({
-    id: p.id,
+    id: `gp:${p.id}`,
     name: p.displayName?.text || "",
     lat: p.location?.latitude,
     lng: p.location?.longitude,
     types: p.types || [],
     rating: p.rating ?? null,
     address: p.shortFormattedAddress || "",
+    source: "google_places",
+    wikidataId: null,
   }));
 
   return places;
 }
 
-// עטיפת cache - קודם memory, אח"כ DB, ואם אין אז Google
-async function getNearbyPlaces(lat, lng, radiusMeters = 800) {
-  const key = makePlacesCacheKey(lat, lng, radiusMeters);
+// ===== OSM Overpass =====
+const OVERPASS_URL = "https://overpass-api.de/api/interpreter";
+
+function overpassQuery(lat, lng, radiusMeters) {
+  // Focus on non-business POIs: historic, tourism attractions/viewpoints, memorials, natural
+  return `
+[out:json][timeout:12];
+(
+  node(around:${radiusMeters},${lat},${lng})[historic];
+  way(around:${radiusMeters},${lat},${lng})[historic];
+  relation(around:${radiusMeters},${lat},${lng})[historic];
+
+  node(around:${radiusMeters},${lat},${lng})[tourism=attraction];
+  way(around:${radiusMeters},${lat},${lng})[tourism=attraction];
+  relation(around:${radiusMeters},${lat},${lng})[tourism=attraction];
+
+  node(around:${radiusMeters},${lat},${lng})[tourism=viewpoint];
+  way(around:${radiusMeters},${lat},${lng})[tourism=viewpoint];
+  relation(around:${radiusMeters},${lat},${lng})[tourism=viewpoint];
+
+  node(around:${radiusMeters},${lat},${lng})[memorial];
+  way(around:${radiusMeters},${lat},${lng})[memorial];
+  relation(around:${radiusMeters},${lat},${lng})[memorial];
+
+  node(around:${radiusMeters},${lat},${lng})[natural];
+  way(around:${radiusMeters},${lat},${lng})[natural];
+  relation(around:${radiusMeters},${lat},${lng})[natural];
+);
+out center tags 40;
+`.trim();
+}
+
+function safeTag(tags, key) {
+  if (!tags) return "";
+  const v = tags[key];
+  return typeof v === "string" ? v : "";
+}
+
+function normalizeNameFromOsm(tags) {
+  const n = safeTag(tags, "name");
+  if (n) return n;
+  const en = safeTag(tags, "name:en");
+  if (en) return en;
+  const he = safeTag(tags, "name:he");
+  if (he) return he;
+  return "";
+}
+
+function osmElementToPoi(el) {
+  const type = el.type; // node/way/relation
+  const id = el.id;
+  const tags = el.tags || {};
+  const name = normalizeNameFromOsm(tags);
+
+  let lat = null;
+  let lng = null;
+
+  if (type === "node") {
+    lat = el.lat;
+    lng = el.lon;
+  } else {
+    // ways/relations
+    if (el.center && typeof el.center.lat === "number" && typeof el.center.lon === "number") {
+      lat = el.center.lat;
+      lng = el.center.lon;
+    }
+  }
+
+  if (typeof lat !== "number" || typeof lng !== "number") return null;
+
+  const wikidataId = safeTag(tags, "wikidata") || null;
+
+  return {
+    id: `osm:${type}/${id}`,
+    name: name || "",
+    lat,
+    lng,
+    types: Object.keys(tags).slice(0, 10),
+    rating: null,
+    address: "",
+    source: "osm",
+    wikidataId,
+    osmTags: tags,
+  };
+}
+
+async function fetchNearbyPoisFromOSM(lat, lng, radiusMeters = 800) {
+  const q = overpassQuery(lat, lng, radiusMeters);
+
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 9000);
+
+  try {
+    const resp = await fetch(OVERPASS_URL, {
+      method: "POST",
+      headers: {
+        "Content-Type": "text/plain; charset=utf-8",
+        "User-Agent": "on-the-road-server/1.0 (contact: not-set)",
+      },
+      body: q,
+      signal: controller.signal,
+    });
+
+    if (!resp.ok) {
+      const text = await resp.text();
+      console.error("Overpass error:", resp.status, text.slice(0, 400));
+      throw new Error("Overpass API error");
+    }
+
+    const data = await resp.json();
+
+    const elements = Array.isArray(data.elements) ? data.elements : [];
+    const pois = [];
+
+    for (const el of elements) {
+      const poi = osmElementToPoi(el);
+      if (!poi) continue;
+
+      // must have at least a name or a wikidata id
+      if (!poi.name && !poi.wikidataId) continue;
+
+      pois.push(poi);
+    }
+
+    return pois.slice(0, 30);
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+// ===== Wikidata SPARQL around =====
+const WIKIDATA_SPARQL = "https://query.wikidata.org/sparql";
+
+function qidFromEntityUrl(url) {
+  if (typeof url !== "string") return null;
+  const m = url.match(/\/entity\/(Q\d+)$/);
+  return m ? m[1] : null;
+}
+
+async function fetchNearbyPoisFromWikidata(lat, lng, radiusMeters = 800, language = "en") {
+  const radiusKm = Math.max(0.1, Math.min(5, radiusMeters / 1000));
+
+  const query = `
+SELECT ?item ?itemLabel ?itemDescription ?lat ?lon WHERE {
+  SERVICE wikibase:around {
+    ?item wdt:P625 ?location .
+    bd:serviceParam wikibase:center "Point(${lng} ${lat})"^^geo:wktLiteral .
+    bd:serviceParam wikibase:radius "${radiusKm}" .
+  }
+  BIND(geof:latitude(?location) AS ?lat)
+  BIND(geof:longitude(?location) AS ?lon)
+  SERVICE wikibase:label { bd:serviceParam wikibase:language "${language},he,en". }
+}
+LIMIT 25
+`.trim();
+
+  const url = `${WIKIDATA_SPARQL}?format=json&query=${encodeURIComponent(query)}`;
+
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 9000);
+
+  try {
+    const resp = await fetch(url, {
+      method: "GET",
+      headers: {
+        "Accept": "application/sparql-results+json",
+        "User-Agent": "on-the-road-server/1.0 (contact: not-set)",
+      },
+      signal: controller.signal,
+    });
+
+    if (!resp.ok) {
+      const text = await resp.text();
+      console.error("Wikidata around error:", resp.status, text.slice(0, 400));
+      throw new Error("Wikidata SPARQL error");
+    }
+
+    const data = await resp.json();
+    const bindings = data?.results?.bindings || [];
+
+    const pois = [];
+    for (const b of bindings) {
+      const qid = qidFromEntityUrl(b.item?.value);
+      if (!qid) continue;
+
+      const name = b.itemLabel?.value || "";
+      const desc = b.itemDescription?.value || "";
+      const latV = Number(b.lat?.value);
+      const lngV = Number(b.lon?.value);
+
+      if (!Number.isFinite(latV) || !Number.isFinite(lngV)) continue;
+      if (!name) continue;
+
+      pois.push({
+        id: `wd:${qid}`,
+        name,
+        lat: latV,
+        lng: lngV,
+        types: [],
+        rating: null,
+        address: "",
+        source: "wikidata",
+        wikidataId: qid,
+        description: desc,
+      });
+    }
+
+    return pois;
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+// ===== Wikidata facts =====
+async function fetchWikidataFacts(qid, language = "en") {
+  if (!qid) return { facts: [], sources: [] };
+
+  const cacheKey = `${qid}|${language}`;
+  const cached = wikidataFactsMemory.get(cacheKey);
+  if (cached) return cached;
+
+  const query = `
+SELECT ?itemLabel ?itemDescription ?inception ?inceptionLabel ?namedAfterLabel ?architectLabel ?instanceLabel WHERE {
+  BIND(wd:${qid} AS ?item)
+  OPTIONAL { ?item wdt:P571 ?inception . }
+  OPTIONAL { ?item wdt:P138 ?namedAfter . }
+  OPTIONAL { ?item wdt:P84 ?architect . }
+  OPTIONAL { ?item wdt:P31 ?instance . }
+  SERVICE wikibase:label { bd:serviceParam wikibase:language "${language},he,en". }
+}
+LIMIT 1
+`.trim();
+
+  const url = `${WIKIDATA_SPARQL}?format=json&query=${encodeURIComponent(query)}`;
+
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 9000);
+
+  try {
+    const resp = await fetch(url, {
+      method: "GET",
+      headers: {
+        "Accept": "application/sparql-results+json",
+        "User-Agent": "on-the-road-server/1.0 (contact: not-set)",
+      },
+      signal: controller.signal,
+    });
+
+    if (!resp.ok) {
+      const text = await resp.text();
+      console.error("Wikidata facts error:", resp.status, text.slice(0, 400));
+      return { facts: [], sources: [] };
+    }
+
+    const data = await resp.json();
+    const b = data?.results?.bindings?.[0];
+    if (!b) return { facts: [], sources: [] };
+
+    const label = b.itemLabel?.value || "";
+    const desc = b.itemDescription?.value || "";
+    const instance = b.instanceLabel?.value || "";
+    const inceptionLabel = b.inceptionLabel?.value || "";
+    const namedAfter = b.namedAfterLabel?.value || "";
+    const architect = b.architectLabel?.value || "";
+
+    const facts = [];
+
+    if (label && instance) facts.push(`It is a ${instance}.`);
+    if (desc) facts.push(`Short description: ${desc}.`);
+    if (inceptionLabel) facts.push(`Inception or opening: ${inceptionLabel}.`);
+    if (namedAfter) facts.push(`Named after: ${namedAfter}.`);
+    if (architect) facts.push(`Architect: ${architect}.`);
+
+    const sources = [
+      { type: "wikidata", qid, url: `https://www.wikidata.org/wiki/${qid}` },
+    ];
+
+    const result = { facts: facts.slice(0, 5), sources };
+    wikidataFactsMemory.set(cacheKey, result);
+    return result;
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+// ===== Unified POI fetch with cache =====
+async function getNearbyPois(lat, lng, radiusMeters = 800, mode = "interesting", language = "en") {
+  const key = makePlacesCacheKey(lat, lng, radiusMeters, mode);
 
   const mem = placesCacheMemory.get(key);
   if (mem) return mem;
@@ -274,18 +559,54 @@ async function getNearbyPlaces(lat, lng, radiusMeters = 800) {
         [key]
       );
       if (rows.length > 0) {
-        const places = rows[0].places_json;
-        placesCacheMemory.set(key, places);
-        return places;
+        const pois = rows[0].places_json;
+        placesCacheMemory.set(key, pois);
+        return pois;
       }
     } catch (err) {
-      console.error("DB error in getNearbyPlaces (select):", err);
+      console.error("DB error in getNearbyPois (select):", err);
     }
   }
 
-  const fresh = await fetchNearbyPlacesFromGoogle(lat, lng, radiusMeters);
+  let pois = [];
+  if (mode === "interesting") {
+    // Prefer OSM + Wikidata
+    const [osm, wd] = await Promise.allSettled([
+      fetchNearbyPoisFromOSM(lat, lng, radiusMeters),
+      fetchNearbyPoisFromWikidata(lat, lng, radiusMeters, language),
+    ]);
 
-  placesCacheMemory.set(key, fresh);
+    if (osm.status === "fulfilled") pois = pois.concat(osm.value);
+    if (wd.status === "fulfilled") pois = pois.concat(wd.value);
+
+    // If nothing, fallback to Google Places
+    if (pois.length === 0) {
+      try {
+        const gp = await fetchNearbyPlacesFromGoogle(lat, lng, radiusMeters);
+        pois = gp;
+      } catch (e) {
+        // ignore
+      }
+    }
+  } else {
+    // Legacy mode: Google Places
+    pois = await fetchNearbyPlacesFromGoogle(lat, lng, radiusMeters);
+  }
+
+  // light de-dupe by coordinate + name
+  const seen = new Set();
+  const deduped = [];
+  for (const p of pois) {
+    const nameKey = (p.name || "").trim().toLowerCase();
+    const latKey = typeof p.lat === "number" ? p.lat.toFixed(4) : "x";
+    const lngKey = typeof p.lng === "number" ? p.lng.toFixed(4) : "y";
+    const k = `${nameKey}|${latKey}|${lngKey}`;
+    if (seen.has(k)) continue;
+    seen.add(k);
+    deduped.push(p);
+  }
+
+  placesCacheMemory.set(key, deduped);
 
   if (pool) {
     try {
@@ -295,275 +616,220 @@ async function getNearbyPlaces(lat, lng, radiusMeters = 800) {
         VALUES ($1, $2, now())
         ON CONFLICT (cache_key)
         DO UPDATE SET places_json = EXCLUDED.places_json, updated_at = now()
-      `,
-        [key, JSON.stringify(fresh)]
+        `,
+        [key, JSON.stringify(deduped)]
       );
     } catch (err) {
-      console.error("DB error in getNearbyPlaces (upsert):", err);
+      console.error("DB error in getNearbyPois (upsert):", err);
     }
   }
 
-  return fresh;
+  return deduped;
 }
 
-// 5. חישוב מרחק במטרים
-function distanceMeters(lat1, lng1, lat2, lng2) {
-  const R = 6371000;
-  const toRad = (deg) => (deg * Math.PI) / 180;
-
-  const dLat = toRad(lat2 - lat1);
-  const dLng = toRad(lng2 - lng1);
-
-  const a =
-    Math.sin(dLat / 2) * Math.sin(dLat / 2) +
-    Math.cos(toRad(lat1)) *
-      Math.cos(toRad(lat2)) *
-      Math.sin(dLng / 2) *
-      Math.sin(dLng / 2);
-
-  const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
-  return R * c;
-}
-
-/**
- * בחירת מקום "מועדף" ליוזר:
- * - מחזיר רק מקום שהיוזר הזה עדיין לא שמע עליו
- * - אם כל המקומות כבר נשמעו אצל היוזר הזה - מחזיר null
- */
-async function pickBestPlaceForUser(places, lat, lng, userKey) {
-  if (!places || places.length === 0) return null;
+// ===== Pick best POI with "quality gate" =====
+async function pickBestPoiForUser(pois, lat, lng, userKey, language) {
+  if (!pois || pois.length === 0) return null;
 
   const heardSet = await getHeardSetForUser(userKey);
 
-  let bestNew = null;
-  let bestNewDist = null;
-
-  for (const p of places) {
+  // score candidates
+  const candidates = [];
+  for (const p of pois) {
     if (typeof p.lat !== "number" || typeof p.lng !== "number") continue;
-    const d = distanceMeters(lat, lng, p.lat, p.lng);
 
-    if (!heardSet.has(p.id)) {
-      if (bestNewDist === null || d < bestNewDist) {
-        bestNewDist = d;
-        bestNew = p;
-      }
+    const d = distanceMeters(lat, lng, p.lat, p.lng);
+    if (d > 1500) continue;
+
+    if (heardSet.has(p.id)) continue;
+
+    // bonus for wikidata id (more likely to have facts)
+    const hasWd = !!(p.wikidataId && typeof p.wikidataId === "string");
+    const bonus = hasWd ? 250 : 0;
+
+    const score = d - bonus;
+
+    candidates.push({ p, d, score });
+  }
+
+  candidates.sort((a, b) => a.score - b.score);
+
+  // quality gate: need at least 2 facts
+  for (const c of candidates.slice(0, 10)) {
+    const poi = c.p;
+
+    const qid = poi.wikidataId || (poi.id.startsWith("wd:") ? poi.id.replace("wd:", "") : null);
+    const { facts, sources } = qid ? await fetchWikidataFacts(qid, language === "he" ? "he" : "en") : { facts: [], sources: [] };
+
+    // Accept if enough facts, or if we have a good description
+    const enough = facts.length >= 2 || (typeof poi.description === "string" && poi.description.trim().length > 20);
+
+    if (enough) {
+      return {
+        chosen: poi,
+        distanceMeters: c.d,
+        facts,
+        sources,
+      };
     }
   }
 
-  if (bestNew) {
-    return {
-      chosen: bestNew,
-      distanceMeters: bestNewDist,
-      isNew: true,
-    };
-  }
-
-  // אין מקום חדש ליוזר הזה - לא בוחרים POI כדי לא לחזור על אותו מקום
   return null;
 }
 
-// 6. /places - debug
+// ===== system prompts (tighten anti-hallucination) =====
+function getSystemMessage(language) {
+  if (language === "en") {
+    return `
+You are the storyteller voice of a driving app.
+
+Hard truth rules:
+- Use ONLY the factual notes provided to you under "FACTS". If a detail is not in FACTS, you must not state it as fact.
+- If FACTS are too thin, produce "NO_STORY" exactly.
+
+Speaking style:
+- Short, witty, surprising, but factual and deep.
+- Exactly one paragraph, 40 to 70 words.
+
+Other rules:
+- No greetings.
+- Start immediately with the most interesting fact.
+- No city name unless it appears in the provided place name or address line.
+`.trim();
+  }
+
+  if (language === "fr") {
+    return `
+Tu es la voix d'un conteur pour une application de conduite.
+
+Règles de vérité:
+- Utilise UNIQUEMENT les notes factuelles fournies sous "FACTS". Si ce n'est pas dans FACTS, tu ne dois pas l'affirmer.
+- Si FACTS est trop pauvre, réponds exactement "NO_STORY".
+
+Style:
+- Court, surprenant, avec une touche d'humour, mais factuel et un peu profond.
+- Un seul paragraphe, 40 à 70 mots.
+
+Autres règles:
+- Pas de salutations.
+- Commence directement par le fait le plus intéressant.
+- Ne mentionne pas une ville si elle n'apparaît pas dans le nom ou l'adresse fournis.
+`.trim();
+  }
+
+  // he
+  return `
+אתה הקריין של אפליקציית נהיגה.
+
+חוקי אמת:
+- אתה משתמש רק בעובדות שניתנו לך תחת "FACTS". אם פרט לא נמצא ב-FACTS אסור לך להציג אותו כעובדה.
+- אם FACTS דל מדי, אתה מחזיר בדיוק "NO_STORY".
+
+סגנון:
+- קצר, שנון, מפתיע, אבל מדויק ועם עומק.
+- פסקה אחת בלבד, 40 עד 70 מילים.
+
+חוקים נוספים:
+- בלי ברכות פתיחה.
+- להתחיל ישר בעובדה הכי מעניינת.
+- לא לציין שם עיר אם הוא לא מופיע במפורש בשם המקום או בשורת הכתובת שניתנו לך.
+`.trim();
+}
+
+// ===== debug endpoint =====
 app.get("/places", async (req, res) => {
   try {
-    const { lat, lng, radius } = req.query;
+    const { lat, lng, radius, mode, language } = req.query;
 
     if (!lat || !lng) {
-      return res
-        .status(400)
-        .json({ error: "lat and lng query params are required" });
+      return res.status(400).json({ error: "lat and lng query params are required" });
     }
 
     const radiusMeters = radius ? Number(radius) : 800;
+    const m = typeof mode === "string" ? mode : "interesting";
+    const lang = typeof language === "string" ? language : "en";
 
-    const places = await getNearbyPlaces(
-      Number(lat),
-      Number(lng),
-      radiusMeters
-    );
-
-    res.json({ places });
+    const pois = await getNearbyPois(Number(lat), Number(lng), radiusMeters, m, lang);
+    res.json({ pois });
   } catch (err) {
     console.error("Error in /places:", err);
     res.status(500).json({ error: "failed_to_fetch_places" });
   }
 });
 
-// 7. system prompt לפי שפה – עם דגש על מקור השם וסיפור "עסיסי"
-function getSystemMessage(language) {
-  switch (language) {
-    case "en":
-      return `
-You are the storyteller voice of a driving app called "On The Road".
-
-Speaking style:
-- You talk like a road storyteller: witty, clever, amused, like a successful stand up comedian who knows how to keep an audience hooked, but in a calm and clear voice that fits a driver who cannot focus only on you.
-- Your goal is to make the driver smile, get curious, and feel like they are getting a "local secret" about the place they are passing by.
-- Use relatively short sentences, with commas and natural pauses that create a bit of suspense before the punchline, but without shouting or over-dramatic tone and without distracting the driver from the road.
-- Include clear light humor: at least two or three playful turns of phrase, winks or gentle jokes, but never full stand up mode.
-
-Golden fact and name-based stories:
-- Whenever the place name, street name or neighborhood name looks like a real person's name (for example a street named after someone), treat the story behind that name as your golden fact.
-- Briefly tell who that person was, what they did, and why this place is named after them. Pick one "juicy" but well-documented detail from their life – a big argument, a risky decision, a famous failure, or a dramatic turning point – but never invent scandals or gossip.
-- If the name comes from the Bible, a myth or an old story, tell one short, vivid scene from that story, with a focus on the human conflict inside it.
-- If you know almost nothing solid about the origin of the name, do not invent it. Instead, choose another "juicy" fact from the nearby area: a local protest, a major planning change, a historical disaster, or an unusual love story reported in the press – but only if you are confident it really happened.
-- Always prefer human-scale stories with real people, decisions, mistakes and turning points, rather than dry geographical explanations.
-
-Hard rules:
-- Always answer in English only, with no greetings like "Hello" or "Hi".
-- Start immediately with the golden fact - your first sentence must already contain the most interesting core idea.
-- Choose exactly one strong, intriguing golden fact about a place or a name that is within a few tens of meters from the driver. Only if there is no choice, you may expand up to about one kilometer.
-- If you are not confident there is a relevant place in that range, say explicitly that you are talking a bit more generally about the nearby area, and do not invent details. It is better to be cautious than fake precise.
-- You are not allowed to mention the name of any city, neighborhood or district unless it appears exactly in the address or place name given to you. Do not invent city names. If you do not see a city name in the data, avoid mentioning a city at all.
-- Never state that the driver is in a specific city that was not explicitly given in the input.
-- Do not talk about a place that is clearly more than one kilometer away or about a different city.
-- Focus mainly on that one golden fact: what happened, when it happened if known, why it matters today, and how it connects to what the driver sees around them.
-- You may add one or two extra details only if they directly reinforce that same fact. Do not drift to unrelated topics.
-- Avoid generic tourist phrases like "this is a vibrant city full of life". Prefer concrete details: dates, people, buildings, events.
-- Do not end with any generic wrap-up sentence such as "so next time you pass here, remember...", "so yes, this is the place", "in short" or any meta summary of what you just said.
-- The last sentence must contain a specific factual or humorous detail about the place or the name itself, not a general reflection or conclusion.
-- Exactly one short flowing paragraph, no bullet points, about 40 to 70 words.
-`;
-    case "fr":
-      return `
-Tu es la voix de conteur d'une application de conduite appelée "On The Road".
-
-Style de parole:
-- Tu parles comme un conteur de route: vif, malin, amusé, comme un humoriste qui sait captiver son public, mais avec une voix calme et claire, adaptée à un conducteur qui ne peut pas se concentrer uniquement sur toi.
-- Ton objectif est de faire sourire le conducteur, éveiller sa curiosité, et lui donner l'impression de recevoir un "secret local" sur l'endroit qu'il est en train de longer.
-- Utilise des phrases plutôt courtes, avec des virgules et des pauses naturelles qui créent un peu de suspense avant la chute, mais sans cris, sans drame exagéré et sans distraire le conducteur de la route.
-- Intègre un peu plus d'humour: au moins deux ou trois clins d'œil, tournures amusantes ou images légères, sans tomber dans le stand up.
-
-Fait en or et origine du nom:
-- Chaque fois que le nom du lieu, de la rue ou du quartier ressemble au nom d'une personne réelle (par exemple une rue portant un nom de personnalité), considère l'histoire derrière ce nom comme ton fait en or.
-- Raconte brièvement qui était cette personne, ce qu'elle a fait, et pourquoi cet endroit porte son nom. Choisis un détail "juteux" mais bien documenté de sa vie – une grande dispute, une décision risquée, un échec célèbre ou un moment de bascule – mais n'invente jamais de scandales ou de ragots.
-- Si le nom vient de la Bible, d'un mythe ou d'un vieux récit, raconte une scène courte et vivante de cette histoire, en mettant l'accent sur le conflit humain.
-- Si tu ne sais presque rien de solide sur l'origine du nom, n'invente pas. Choisis plutôt un autre fait "juteux" de la zone proche: une protestation locale, un grand changement d'urbanisme, une catastrophe historique ou une histoire d'amour inhabituelle rapportée dans la presse – mais seulement si tu es sûr que cela a vraiment eu lieu.
-- Donne toujours la priorité aux histoires humaines avec des personnes réelles, des décisions, des erreurs et des tournants, plutôt qu'à des explications géographiques sèches.
-
-Règles strictes:
-- Réponds toujours uniquement en français, sans formules de salutation comme "Bonjour" ou "Salut".
-- Commence directement par le fait en or - ta première phrase doit déjà contenir le cœur intéressant.
-- Choisis un seul fait en or, fort et intrigant, sur un lieu ou un nom situé à quelques dizaines de mètres du conducteur. Ce n’est qu’en dernier recours que tu peux t’élargir jusqu’à environ un kilomètre.
-- Si tu n’es pas sûr qu’il y ait un lieu pertinent dans cette zone, dis clairement que tu parles de manière un peu plus générale de la zone proche, et n’invente pas de détails. Il vaut mieux être prudent que faussement précis.
-- Tu n'as pas le droit de mentionner le nom d'une ville, d'un quartier ou d'un district s'il n'apparaît pas exactement dans l'adresse ou le nom du lieu fourni. N'invente pas de noms de villes. Si tu ne vois pas de nom de ville dans les données, ne mentionne aucune ville.
-- Ne dis jamais que le conducteur se trouve dans une ville précise qui n'est pas explicitement donnée en entrée.
-- Ne parle pas d’un endroit qui se trouve clairement à plus d’un kilomètre ni d’une autre ville.
-- Concentre-toi surtout sur ce fait en or: ce qui s’est passé, quand cela s’est passé si on le sait, pourquoi c’est important aujourd’hui, et comment cela se connecte à ce que le conducteur voit autour de lui.
-- Tu peux ajouter un ou deux détails supplémentaires seulement s’ils renforcent directement ce même fait. Ne dérive pas vers d’autres sujets.
-- Évite les phrases touristiques génériques comme "c’est une ville dynamique et pleine de vie". Préfère des détails concrets: dates, personnes, bâtiments, événements.
-- Ne termine pas par une phrase de conclusion générique ou méta du type "alors la prochaine fois que tu passeras ici...", "en bref", "voilà pour cet endroit". Termine simplement après le dernier détail concret ou la dernière petite chute amusante.
-- La dernière phrase doit contenir un détail précis ou une touche d'humour sur le lieu ou sur le nom lui-même, et non une réflexion générale ou un résumé.
-- Un seul paragraphe court et fluide, sans listes, d’environ 40 à 70 mots.
-`;
-    case "he":
-    default:
-      return `
-אתה הקריין של אפליקציית נהיגה בשם "On The Road".
-
-סטייל הדיבור:
-- אתה מדבר כמו מספר סיפורים על הכביש: שנון, חכם, משועשע, כמו קומיקאי מעולה שמספר בדיחה לאוטו מלא חברים, אבל בקול רגוע וברור שמתאים לנהג שלא יכול להתרכז רק בך.
-- המטרה שלך היא לגרום לנהג לחייך, להיות מסוקרן, ולהרגיש שהוא מקבל "סוד מקומי" על המקום שהוא חולף לידו.
-- השתמש במשפטים קצרים יחסית, עם פסיקים ושלוש נקודות (...) במקומות שבהם אתה רוצה עצירה קצרה ונשימה, כדי לבנות מתח לפני הפאנץ.
-- שלב לפחות שלוש נקודות הומור קטנות לאורך הפסקה - שאלה רטורית, דימוי מצחיק, ניסוח מפתיע, או טוויסט קטן בסוף משפט - בלי להפוך את הכל למופע סטנדאפ מלא.
-
-עובדת זהב ומקור השם:
-- בכל פעם ששם המקום, הרחוב או השכונה נשמע כמו שם של אדם אמיתי (למשל רחוב על שם אישיות), התייחס לסיפור מאחורי השם כאל עובדת הזהב שלך.
-- ספר בקצרה מי היה האדם הזה, מה הוא עשה, ולמה קראו על שמו דווקא את המקום הזה. בחר פרט אחד "עסיסי" אבל מתועד היטב מחייו - ויכוח גדול, החלטה מסוכנת, כישלון מפורסם או רגע דרמטי - אבל אל תמציא רכילות או שערוריות.
-- אם השם מגיע מהתנ"ך, ממיתוס או מסיפור עתיק, ספר סצנה קצרה וצבעונית מאותו סיפור, עם דגש על הקונפליקט האנושי שבו.
-- אם אתה כמעט לא יודע שום דבר מוצק על מקור השם, אל תמציא. במקום זה בחר עובדה "עסיסית" אחרת מהאזור הקרוב: מאבק תושבים, שינוי תכנוני גדול, אסון היסטורי, או סיפור אהבה משונה שזכור מהעיתונות - אבל רק אם אתה בטוח שזה אכן קרה.
-- תמיד תן עדיפות לסיפורים אנושיים, עם אנשים בשר ודם, החלטות, טעויות ורגעי תפנית, ולא להסברים גאוגרפיים יבשים.
-
-חוקים קשיחים לתוכן:
-- לענות תמיד בשפה שהמשתמש ביקש בלבד, בלי משפטי פתיחה כמו "שלום" או "היי".
-- להתחיל ישר בעובדת הזהב - המשפט הראשון שלך צריך כבר להכיל את הליבה המעניינת.
-- לבחור עובדת זהב אחת בלבד, חזקה ומסקרנת, על מקום או על שם שנמצא כמה עשרות מטרים ממיקום הנהג. רק אם אין ברירה, אפשר להתרחב לכל היותר עד קילומטר אחד.
-- אם אין לך ביטחון בעובדה על מקום בטווח הזה, אמור במפורש שאתה מדבר באופן קצת יותר כללי על האזור הקרוב, ואל תמציא פרטים. עדיף להיות זהיר מאשר "מדויק" לכאורה.
-- אסור לך להזכיר שם של עיר, שכונה או רובע שלא הופיע במפורש בשם המקום או בכתובת שניתנו לך. אל תמציא שמות כמו "קריית המדע" או עיר אחרת אם הם לא מופיעים בנתונים.
-- אל תגיד שהנהג נמצא בעיר מסוימת אם שם העיר לא הופיע במפורש בכתובת שקיבלת.
-- אסור לספר על מקום שנמצא בבירור מעבר לקילומטר ממיקום הנהג, ובוודאי לא על עיר אחרת לגמרי.
-- הרחב בעיקר על אותה עובדת זהב אחת: מה קרה, מתי זה קרה אם ידוע, למה זה חשוב היום, ואיך זה מתחבר למה שהנהג רואה סביבו.
-- אפשר להוסיף עוד פרט אחד או שניים רק אם הם מחזקים ישירות את אותה עובדה. לא להתפזר לנושאים אחרים.
-- להימנע ממשפטי תיירות כלליים כמו "זו עיר תוססת ומלאת חיים". תעדיף פרטים קונקרטיים, תאריכים, אנשים, מבנים או אירועים, במיוחד כאלה שיש בהם קונפליקט, החלטה אמיצה או מחיר אישי.
-- אסור לך לסיים במשפט סיכום כללי או סתמי, כמו "אז בפעם הבאה שתעברו כאן...", "אז כן, זה המקום", "בקיצור" או כל משפט שמסכם או מדבר על מה שסיפרת עכשיו.
-- המשפט האחרון שלך חייב להכיל פרט קונקרטי או פאנץ' קטן על המקום עצמו או על האדם שהשם מנציח - לא מחשבה כללית, לא סיכום, ולא המלצה לעתיד.
-- פסקה אחת קצרה וזורמת, בלי נקודות רשימה, באורך בערך 40 עד 70 מילים.
-`;
-  }
-}
-
-// 8. /api/story-both
+// ===== main endpoint =====
 app.post("/api/story-both", async (req, res) => {
   try {
     const { prompt, lat, lng } = req.body;
     let { language } = req.body;
 
     if (!prompt || typeof prompt !== "string") {
-      return res
-        .status(400)
-        .json({ error: "Missing 'prompt' in request body (string required)" });
+      return res.status(400).json({ error: "Missing 'prompt' in request body (string required)" });
     }
 
-    if (!language || typeof language !== "string") {
-      language = "he";
-    }
+    if (!language || typeof language !== "string") language = "he";
     language = language.toLowerCase();
-    if (!["he", "en", "fr"].includes(language)) {
-      language = "he";
-    }
+    if (!["he", "en", "fr"].includes(language)) language = "he";
 
     const userKey = getUserKeyFromRequest(req);
 
     let locationLine = "Driver location is unknown.";
     let poiLine = "";
+    let factsBlock = "";
+    let sources = [];
+    let chosenPoiId = null;
 
     if (typeof lat === "number" && typeof lng === "number") {
-      locationLine = `Approximate driver location: latitude ${lat.toFixed(
-        4
-      )}, longitude ${lng.toFixed(4)}.`;
+      locationLine = `Approximate driver location: latitude ${lat.toFixed(4)}, longitude ${lng.toFixed(4)}.`;
 
       try {
-        // מחפשים מקום חדש ליוזר בטווחים הולכים וגדלים: 400, 800, 1500 מטר
-        let bestInfo = null;
+        // Expand radius gradually
+        const radii = [400, 800, 1500];
+        let best = null;
 
-        const places400 = await getNearbyPlaces(lat, lng, 400);
-        bestInfo = await pickBestPlaceForUser(places400, lat, lng, userKey);
-
-        if (!bestInfo) {
-          const places800 = await getNearbyPlaces(lat, lng, 800);
-          bestInfo = await pickBestPlaceForUser(
-            places800,
-            lat,
-            lng,
-            userKey
-          );
+        for (const r of radii) {
+          const pois = await getNearbyPois(lat, lng, r, "interesting", language === "he" ? "he" : "en");
+          best = await pickBestPoiForUser(pois, lat, lng, userKey, language);
+          if (best) break;
         }
 
-        if (!bestInfo) {
-          const places1500 = await getNearbyPlaces(lat, lng, 1500);
-          bestInfo = await pickBestPlaceForUser(
-            places1500,
-            lat,
-            lng,
-            userKey
-          );
-        }
+        if (best && best.chosen) {
+          const poi = best.chosen;
+          const distRounded = Math.round(best.distanceMeters ?? 0);
 
-        if (bestInfo && bestInfo.chosen) {
-          const best = bestInfo.chosen;
-          const distRounded = Math.round(bestInfo.distanceMeters ?? 0);
-          poiLine = `Nearby point of interest (distance about ${distRounded} meters): "${best.name}", address: ${best.address}. Use this specific place and especially its name as the main focus of the story.`;
+          chosenPoiId = poi.id;
+          sources = Array.isArray(best.sources) ? best.sources : [];
 
-          await markPlaceHeardForUser(userKey, best.id);
+          // keep city safe: do not inject city here unless you have it
+          const placeName = poi.name ? `"${poi.name}"` : `"nearby point"`;
+
+          poiLine = `Nearby point of interest (distance about ${distRounded} meters): ${placeName}. Use this as the main focus.`;
+
+          const facts = Array.isArray(best.facts) ? best.facts : [];
+          if (facts.length > 0) {
+            const lines = facts.slice(0, 5).map((f, i) => `FACT ${i + 1}: ${f}`);
+            factsBlock = `FACTS:\n${lines.join("\n")}`;
+          }
         }
       } catch (e) {
-        console.error("Failed to fetch places for story-both:", e);
+        console.error("Failed to fetch POIs for story-both:", e);
       }
+    }
+
+    // If we have no facts, we prefer silence
+    if (!factsBlock) {
+      return res.json({
+        shouldSpeak: false,
+        reason: "no_strong_poi_or_facts",
+        language,
+      });
     }
 
     const systemMessage = getSystemMessage(language);
 
     const userMessage = `${locationLine}
-${poiLine ? poiLine + "\n" : ""}User request: ${prompt}`;
+${poiLine ? poiLine + "\n" : ""}${factsBlock}
+User request: ${prompt}`;
 
     const completion = await openai.chat.completions.create({
       model: "gpt-4.1-mini",
@@ -571,24 +837,36 @@ ${poiLine ? poiLine + "\n" : ""}User request: ${prompt}`;
         { role: "system", content: systemMessage },
         { role: "user", content: userMessage },
       ],
-      temperature: 0.5,
+      temperature: 0.4,
     });
 
     const storyText = completion.choices[0]?.message?.content?.trim();
-    if (!storyText) {
-      throw new Error("No story generated by OpenAI");
+    if (!storyText) throw new Error("No story generated by OpenAI");
+
+    if (storyText === "NO_STORY") {
+      return res.json({
+        shouldSpeak: false,
+        reason: "model_refused_due_to_thin_facts",
+        language,
+      });
     }
 
-    const { audioBase64, voiceId, voiceIndex, voiceKey } =
-      await ttsWithOpenAI(storyText, language);
+    const { audioBase64, voiceId, voiceIndex, voiceKey } = await ttsWithOpenAI(storyText, language);
+
+    // Mark as heard only if we actually spoke
+    if (chosenPoiId) {
+      await markPlaceHeardForUser(userKey, chosenPoiId);
+    }
 
     res.json({
+      shouldSpeak: true,
       text: storyText,
       audioBase64,
       voiceId,
       voiceIndex,
       voiceKey,
       language,
+      sources, // for debug, not spoken
     });
   } catch (err) {
     console.error("Error in /api/story-both:", err);
@@ -596,20 +874,17 @@ ${poiLine ? poiLine + "\n" : ""}User request: ${prompt}`;
   }
 });
 
-// 9. Health check
+// health
 app.get("/health", (req, res) => {
   res.json({
     status: "ok",
-    build: "golden-fact-multi-lang-nearby-juicy-name-he-nova-db-v4-per-user",
+    build: "btw-interesting-osm-wikidata-quality-gate-v1",
   });
 });
 
-// 10. אתחול DB והרצה
-initDb().catch((err) => {
-  console.error("DB init failed:", err);
-});
+initDb().catch((err) => console.error("DB init failed:", err));
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, "0.0.0.0", () => {
-  console.log(`On The Road server listening on port ${PORT}`);
+  console.log(`Server listening on port ${PORT}`);
 });
