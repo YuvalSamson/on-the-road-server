@@ -601,14 +601,36 @@ async function fetchPersonFacts(personQid, language = "en") {
   const cached = wikidataFactsMemory.get(cacheKey);
   if (cached) return cached;
 
+  // We intentionally pull "human" but safe details:
+  // occupation, positions held, notable works, awards, education, and a short description if available.
+  // We DO NOT pull explicit sexual content, and we don't invent anything beyond these facts.
   const query = `
-SELECT ?personLabel ?occupationLabel ?birthYear ?deathYear WHERE {
+SELECT ?personLabel
+       (GROUP_CONCAT(DISTINCT ?occupationLabel; separator=" | ") AS ?occupations)
+       (GROUP_CONCAT(DISTINCT ?positionLabel; separator=" | ") AS ?positions)
+       (GROUP_CONCAT(DISTINCT ?workLabel; separator=" | ") AS ?works)
+       (GROUP_CONCAT(DISTINCT ?awardLabel; separator=" | ") AS ?awards)
+       (GROUP_CONCAT(DISTINCT ?eduLabel; separator=" | ") AS ?education)
+       (GROUP_CONCAT(DISTINCT ?eventLabel; separator=" | ") AS ?events)
+       (MIN(?birthYear) AS ?birthYearMin)
+       (MIN(?deathYear) AS ?deathYearMin)
+WHERE {
+
   BIND(wd:${personQid} AS ?person)
+
   OPTIONAL { ?person wdt:P106 ?occupation . }
+  OPTIONAL { ?person wdt:P39 ?position . }
+  OPTIONAL { ?person wdt:P800 ?work . }
+  OPTIONAL { ?person wdt:P166 ?award . }
+  OPTIONAL { ?person wdt:P69 ?edu . }
+  OPTIONAL { ?person wdt:P793 ?event . }
+
   OPTIONAL { ?person wdt:P569 ?birth . BIND(YEAR(?birth) AS ?birthYear) }
   OPTIONAL { ?person wdt:P570 ?death . BIND(YEAR(?death) AS ?deathYear) }
+
   SERVICE wikibase:label { bd:serviceParam wikibase:language "${language},he,en". }
 }
+GROUP BY ?personLabel
 LIMIT 1
 `.trim();
 
@@ -634,13 +656,23 @@ LIMIT 1
     if (!b) return { facts: [], sources: [] };
 
     const personLabel = b.personLabel?.value || "";
-    const occupation = b.occupationLabel?.value || "";
-    const birthYear = b.birthYear?.value || "";
-    const deathYear = b.deathYear?.value || "";
+    const occupations = (b.occupations?.value || "").trim();
+    const positions = (b.positions?.value || "").trim();
+    const works = (b.works?.value || "").trim();
+    const awards = (b.awards?.value || "").trim();
+    const education = (b.education?.value || "").trim();
+    const events = (b.events?.value || "").trim();
+    const birthYear = b.birthYearMin?.value ? String(b.birthYearMin.value) : "";
+    const deathYear = b.deathYearMin?.value ? String(b.deathYearMin.value) : "";
 
     const facts = [];
     if (personLabel) facts.push(`Person: ${personLabel}.`);
-    if (occupation) facts.push(`Occupation: ${occupation}.`);
+    if (occupations) facts.push(`Occupation(s): ${occupations}.`);
+    if (positions) facts.push(`Position(s) held: ${positions}.`);
+    if (works) facts.push(`Known for / notable work(s): ${works}.`);
+    if (awards) facts.push(`Award(s): ${awards}.`);
+    if (education) facts.push(`Education: ${education}.`);
+    if (events) facts.push(`Significant event(s): ${events}.`);
     if (birthYear && deathYear) facts.push(`Lifespan: ${birthYear}-${deathYear}.`);
     else if (birthYear) facts.push(`Birth year: ${birthYear}.`);
 
@@ -648,7 +680,7 @@ LIMIT 1
       { type: "wikidata", qid: personQid, url: `https://www.wikidata.org/wiki/${personQid}` },
     ];
 
-    const result = { facts: facts.slice(0, 4), sources };
+    const result = { facts: facts.slice(0, 8), sources };
     wikidataFactsMemory.set(cacheKey, result);
     return result;
   } catch {
@@ -860,8 +892,9 @@ Truth rules:
 - Avoid graphic violence or sexual content. Keep it safe for teens.
 
 Output rules:
+- If FACTS include a human-person detail (occupation, award, notable work, position), the last sentence MUST be a light punchline based on that fact (still factual).
 - Exactly one paragraph.
-- 45 to 80 words.
+- 60 to 120 words.
 - No greeting.
 - Use commas and occasional ellipses to help natural speech.
 - Start immediately with the strongest fact.
@@ -880,8 +913,9 @@ Règles de vérité:
 - Évite la violence graphique et le contenu sexuel. Reste safe pour des ados.
 
 Règles de sortie:
+- Si FACTS incluent un détail humain sur une personne (métier, prix, œuvre, poste), la dernière phrase doit être une petite chute basée sur ce fait (tout en restant factuelle).
 - Un seul paragraphe.
-- 45 à 80 mots.
+- 60 à 120 mots.
 - Pas de salutation.
 - Utilise des virgules et parfois des points de suspension (...) pour aider la voix.
 - Commence directement par le fait le plus fort.
@@ -899,8 +933,9 @@ Règles de sortie:
 - לא להכניס אלימות גרפית או תוכן מיני. זה חייב להיות בטוח לבני נוער.
 
 חוקי פלט:
+- אם ב-FACTS יש פרט אנושי על אדם (מקצוע, פרס, יצירה, תפקיד), המשפט האחרון חייב להיות פאנץ' קטן שמבוסס על העובדה הזאת, ועדיין עובדתי.
 - פסקה אחת בלבד.
-- 45 עד 80 מילים.
+- 60 עד 120 מילים.
 - בלי ברכות פתיחה.
 - להשתמש בפסיקים ולעיתים בשלוש נקודות (...) כדי לעזור לקריינות אנושית.
 - להתחיל ישר בעובדה הכי חזקה.
@@ -1026,7 +1061,7 @@ User request: ${prompt}
 app.get("/health", (req, res) => {
   res.json({
     status: "ok",
-    build: "btw-facts-only-round50-better-tts-v1",
+    build: "btw-facts-only-round50-person-events-words120-tts-v1",
   });
 });
 
