@@ -688,6 +688,83 @@ LIMIT 1
   }
 }
 
+
+// ===== Wikipedia summary fallback (from OSM wikipedia tag) =====
+function parseWikipediaTag(wikipediaTag) {
+  // Returns {lang, title} or null
+  if (typeof wikipediaTag !== "string") return null;
+  const trimmed = wikipediaTag.trim();
+  if (!trimmed) return null;
+
+  // formats: "he:כותרת" or "en:Title_with_underscores"
+  const parts = trimmed.split(":");
+  if (parts.length >= 2) {
+    const lang = parts[0].trim().toLowerCase() || "en";
+    const title = parts.slice(1).join(":").trim().replaceAll(" ", "_");
+    if (!title) return null;
+    return { lang, title };
+  }
+
+  // Sometimes it's just a title, assume English
+  return { lang: "en", title: trimmed.replaceAll(" ", "_") };
+}
+
+async function fetchWikipediaSummaryFacts(wikipediaTag, language = "en") {
+  const parsed = parseWikipediaTag(wikipediaTag);
+  if (!parsed) return { facts: [], sources: [] };
+
+  // Prefer tag language, else fallback to requested language, else en
+  const lang = parsed.lang || (language === "he" ? "he" : "en");
+  const title = parsed.title;
+
+  // Wikipedia REST summary API
+  const url = `https://${lang}.wikipedia.org/api/rest_v1/page/summary/${encodeURIComponent(title)}`;
+
+  try {
+    const resp = await abortableFetch(
+      url,
+      {
+        method: "GET",
+        headers: {
+          "Accept": "application/json",
+          "User-Agent": "btw-ontheroad-server/1.0 (contact: none)",
+        },
+      },
+      9000
+    );
+
+    if (!resp.ok) return { facts: [], sources: [] };
+
+    const data = await resp.json();
+
+    // Use only the first 1-2 sentences to keep it factual and compact
+    const extract = typeof data.extract === "string" ? data.extract.trim() : "";
+    if (!extract) return { facts: [], sources: [] };
+
+    // Split into sentences naively (good enough)
+    const parts = extract.split(/(?<=[.!?])\s+/).filter(Boolean);
+    const short = parts.slice(0, 2).join(" ").trim();
+
+    if (!short) return { facts: [], sources: [] };
+
+    const facts = [`Wikipedia summary: ${short}`];
+
+    // Add title as a fact too (helps model stay anchored)
+    const titleHuman = (typeof data.title === "string" && data.title.trim()) ? data.title.trim() : title.replaceAll("_", " ");
+    facts.unshift(`Wikipedia page title: ${titleHuman}.`);
+
+    const pageUrl =
+      (typeof data.content_urls?.desktop?.page === "string" && data.content_urls.desktop.page) ||
+      `https://${lang}.wikipedia.org/wiki/${title}`;
+
+    const sources = [{ type: "wikipedia", lang, title: titleHuman, url: pageUrl }];
+
+    return { facts: facts.slice(0, 3), sources };
+  } catch (e) {
+    return { facts: [], sources: [] };
+  }
+}
+
 // ===== Unified POI retrieval + cache =====
 async function getNearbyPois(lat, lng, radiusMeters = 800, mode = "interesting", language = "en") {
   const key = makeCacheKey(lat, lng, radiusMeters, mode, language);
@@ -854,8 +931,25 @@ async function pickBestPoiForUser(pois, lat, lng, userKey, language) {
     const hardAnchors = countHardAnchors(meta);
     const factsCount = facts.length;
 
-    // Quality gate: at least 4 facts AND at least 2 hard anchors
-    const ok = factsCount >= 4 && hardAnchors >= 2;
+    // Quality gate (relaxed): we prefer strong anchors, but we don't want to go silent in most areas.
+    // Accept if:
+    // - at least 4 facts and at least 1 hard anchor, OR
+    // - at least 6 facts even without anchors.
+    let ok = (factsCount >= 4 && hardAnchors >= 1) || (factsCount >= 6);
+
+    // If Wikidata is weak or missing, try Wikipedia via OSM wikipedia tag (still factual, with source).
+    if (!ok) {
+      const wikiTag = typeof c.p.wikipedia === "string" ? c.p.wikipedia : null;
+      if (wikiTag) {
+        const wr = await fetchWikipediaSummaryFacts(wikiTag, lang);
+        if (Array.isArray(wr.facts) && wr.facts.length > 0) {
+          facts = facts.concat(wr.facts);
+          sources = sources.concat(wr.sources || []);
+        }
+      }
+      const factsCount2 = facts.length;
+      ok = (factsCount2 >= 3 && hardAnchors >= 1) || (factsCount2 >= 5);
+    }
 
     if (!ok) continue;
 
@@ -1061,7 +1155,7 @@ User request: ${prompt}
 app.get("/health", (req, res) => {
   res.json({
     status: "ok",
-    build: "btw-facts-only-round50-person-events-words120-tts-v1",
+    build: "btw-facts-only-round50-wiki-fallback-relaxedgate-words120-tts-v1",
   });
 });
 
