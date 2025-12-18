@@ -1,74 +1,69 @@
 /**
- * OpenAI TTS via Audio API (ESM).
+ * tts.js (ESM) - OpenAI Text-to-Speech
  */
+
 import { config } from "./config.js";
-import { HttpError, sanitizeForTts, safeTrim, clamp } from "./utils.js";
+import { HttpError, sanitizeForTts, safeTrim } from "./utils.js";
+
+export function getTtsContentType() {
+  return "audio/mpeg";
+}
+
+export function audioToBase64(buf) {
+  return Buffer.from(buf).toString("base64");
+}
 
 function requireOpenAIKey() {
   if (!config.openaiApiKey) throw new HttpError(500, "Missing OPENAI_API_KEY");
 }
 
-function contentTypeFor(format) {
-  const f = String(format || "mp3").toLowerCase();
-  if (f === "mp3") return "audio/mpeg";
-  if (f === "wav") return "audio/wav";
-  if (f === "aac") return "audio/aac";
-  if (f === "opus") return "audio/opus";
-  if (f === "flac") return "audio/flac";
-  if (f === "pcm") return "audio/pcm";
-  return "application/octet-stream";
+function getTtsModel() {
+  // Required by OpenAI TTS API
+  return process.env.OPENAI_TTS_MODEL || "gpt-4o-mini-tts";
 }
 
-export function getTtsContentType() {
-  return contentTypeFor(config.openaiTtsResponseFormat);
+function getTtsVoice() {
+  return process.env.OPENAI_TTS_VOICE || "coral";
 }
 
+/**
+ * @param {string} text
+ * @param {{lang?: string}} opts
+ * @returns {Promise<Buffer>}
+ */
 export async function synthesizeTts(text, opts = {}) {
   requireOpenAIKey();
 
   const cleaned = sanitizeForTts(safeTrim(text, 3900), {
-    disallowSexualContent: (config.safety?.disallowSexualContent ?? true),
+    disallowSexualContent: config.safety?.disallowSexualContent ?? true,
   });
   if (!cleaned) throw new HttpError(400, "Empty TTS text after sanitization");
-
-  const model = opts.model || config.openaiTtsModel;
-  const voice = opts.voice || config.openaiTtsVoice;
-  const response_format = opts.responseFormat || config.openaiTtsResponseFormat;
-
-  const speedRaw = (opts.speed ?? config.openaiTtsSpeed);
-  const speed = clamp(Number(speedRaw), 0.25, 4.0);
-
-  const instructions = opts.instructions ?? config.openaiTtsInstructions;
 
   const url = `${config.openaiBaseUrl}/v1/audio/speech`;
 
   const payload = {
-    model,
-    voice,
+    model: getTtsModel(), // <- THIS fixes your current 400
     input: cleaned,
-    response_format,
-    speed,
-    ...(instructions ? { instructions } : {}),
+    voice: getTtsVoice(),
+    format: "mp3",
+    // optional:
+    // instructions: "Speak clearly and naturally.",
   };
 
   const res = await fetch(url, {
     method: "POST",
     headers: {
+      Authorization: `Bearer ${config.openaiApiKey}`,
       "Content-Type": "application/json",
-      "Authorization": `Bearer ${config.openaiApiKey}`,
     },
     body: JSON.stringify(payload),
   });
 
   if (!res.ok) {
-    const maybeText = await res.text().catch(() => "");
-    throw new HttpError(res.status, "OpenAI TTS failed", safeTrim(maybeText, 900));
+    const t = await res.text().catch(() => "");
+    throw new HttpError(res.status, "OpenAI TTS failed", safeTrim(t, 1500));
   }
 
   const arrayBuf = await res.arrayBuffer();
   return Buffer.from(arrayBuf);
-}
-
-export function audioToBase64(audioBuf) {
-  return audioBuf.toString("base64");
 }
