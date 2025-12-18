@@ -36,7 +36,82 @@ app.use(bodyParser.json());
 // OpenAI client
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
+// =======================
+// BTW "what you wanted"
+// =======================
+// - We allow more knowledge from Wikipedia (beyond just 1-2 summary sentences).
+// - We still enforce: story must be based ONLY on facts we provide to the model.
+// - We add a Wikipedia extraction pipeline that pulls page text (MediaWiki API),
+//   extracts candidate sentences, then asks OpenAI to convert them into short atomic facts.
+// - We then ask OpenAI to write a BTW story from these facts with strict anti-filler rules.
+// - We validate output and do one repair pass if needed.
+
+const BTW_MIN_WORDS = 180;
+const BTW_MAX_WORDS = 340;
+
+const BANNED_FILLER_HE = [
+  "עובדה מעניינת",
+  "משמר היסטוריה",
+  "עבר שינויים",
+  "שינויים דמוגרפיים",
+  "שינויים תרבותיים",
+  "תזכורת חיה",
+  "היסטוריה לא יושבת במוזיאון",
+  "שמור על הקצב",
+  "שמור על הערנות",
+  "כעת, כשאתה ממשיך בנסיעה",
+  "תמשיך בנסיעה",
+];
+
+const BANNED_FILLER_EN = [
+  "interesting fact",
+  "it has changed over time",
+  "a reminder that",
+  "history lives",
+  "keep your eyes on the road",
+  "stay alert",
+  "as you continue driving",
+];
+
+function clamp(n, a, b) {
+  return Math.max(a, Math.min(b, n));
+}
+
+function normalizeSpaces(s) {
+  if (typeof s !== "string") return "";
+  return s.replace(/\s+/g, " ").trim();
+}
+
+function countWordsHeuristic(text) {
+  if (typeof text !== "string") return 0;
+  const t = text.trim();
+  if (!t) return 0;
+  return t.split(/\s+/).filter(Boolean).length;
+}
+
+function containsAny(str, needles) {
+  if (!str) return false;
+  const s = String(str);
+  for (const n of needles) {
+    if (n && s.includes(n)) return true;
+  }
+  return false;
+}
+
+function approxHasConcreteAnchor(text) {
+  // rough signal: contains a 4-digit year or a date-like pattern
+  if (typeof text !== "string") return false;
+  const t = text;
+  if (/\b(1[5-9]\d{2}|20\d{2})\b/.test(t)) return true;
+  if (/\b\d{1,2}\s+(January|February|March|April|May|June|July|August|September|October|November|December)\b/i.test(t))
+    return true;
+  if (/\b\d{1,2}[./-]\d{1,2}[./-]\d{2,4}\b/.test(t)) return true;
+  return false;
+}
+
+// =======================
 // ===== TTS =====
+// =======================
 const TTS_VOICES_NON_HE = ["alloy", "fable", "shimmer"];
 
 function pickVoice(language) {
@@ -58,11 +133,11 @@ async function ttsWithOpenAI(text, language = "he") {
   const instructions =
     "Speak in the same language as the input text. " +
     "Sound like a friendly, smart human narrator riding with the driver. " +
-    "Add more natural breathing and micro-pauses: short breaths between clauses, and slightly longer pauses after full stops. " +
-    "Use a warm smile in your tone (audible but subtle), and keep your energy varied so it never sounds monotone. " +
-    "Before a punchline or surprising fact: slow down a little, pause briefly, then deliver it with a light playful lift. " +
+    "Add natural breathing and micro-pauses: short breaths between clauses, and slightly longer pauses after full stops. " +
+    "Use a warm smile in your tone (subtle), and keep energy varied so it does not sound monotone. " +
+    "Before a punchline or surprising fact: slow down a bit, pause briefly, then deliver it with a light playful lift. " +
     "Do not shout. Keep it clear and safe for driving. " +
-    "Avoid overly dramatic acting; aim for natural, conversational storytelling.";
+    "Avoid dramatic acting; aim for natural, conversational storytelling.";
 
   const response = await openai.audio.speech.create({
     model: "gpt-4o-mini-tts",
@@ -77,158 +152,27 @@ async function ttsWithOpenAI(text, language = "he") {
   return { audioBase64, voiceId, voiceIndex, voiceKey };
 }
 
-/**
- * ===== DB + caches =====
- * places_cache: cache_key => pois_json
- * user_place_history: user_key + place_id (we store unified ids like osm:..., wd:..., gp:...)
- */
-
+// =======================
+// ===== DB + caches =====
+// =======================
 const placesCacheMemory = new Map(); // cache_key => pois[]
 const userPlacesHistoryMemory = new Map(); // userKey => Set(placeId)
-const wikidataFactsMemory = new Map(); // qid|lang => { facts, sources, meta }
+const wikidataFactsMemory = new Map(); // qid|lang => { facts, sources, meta } + also used for sitelinks cache
+const wikipediaFactsMemory = new Map(); // wp_facts:lang:title => { facts, sources, meta }
+const wikipediaExtractMemory = new Map(); // wp_extract:lang:title => { extract, titleHuman, url }
 
-// ===== BTW story shaping =====
-const BTW_MIN_WORDS = 110;
-const BTW_MAX_WORDS = 190;
-
-function languageLabel(code) {
-  if (code === "he") return "עברית";
-  if (code === "fr") return "Français";
-  return "English";
-}
-
-function buildBtwPrompt({ languageCode, poiName, distanceText, factsText }) {
-  const lang = languageCode || "he";
-  const placeName = poiName || (lang === "he" ? "מקום לא ידוע" : "Unknown place");
-
-  if (lang === "en") {
-    return `
-You write BTW driving stories. Create one short, interesting story about a nearby place.
-
-Hard rules:
-1) Use ONLY the facts under FACTS. No guessing. No extra knowledge.
-2) No filler like "it changed over time", "it preserves history", "interesting fact:", "a reminder that...".
-3) No superlatives (amazing, incredible, crazy) and no dramatic hype.
-4) Safe for teens. If FACTS mention conflict or violence, refer to it briefly without graphic details.
-5) One paragraph only. No titles, no bullet points.
-6) Length: ${BTW_MIN_WORDS}-${BTW_MAX_WORDS} words.
-7) If FACTS are insufficient to write a meaningful story, output exactly: NO_STORY
-
-Structure:
-- 1-2 sentences to locate the driver: place name + distance.
-- 3-6 short beats, each with a concrete fact (year, event, name).
-- 1 closing sentence that brings it back to the road, non-poetic.
-
-Place: ${placeName}
-Distance: ${distanceText || "unknown"}
-
-FACTS:
-${factsText || ""}
-
-Return only the final story text.
-`.trim();
-  }
-
-  if (lang === "fr") {
-    return `
-Tu écris des histoires BTW pour la conduite. Crée une histoire courte et intéressante sur un lieu proche.
-
-Règles strictes:
-1) Utilise UNIQUEMENT les faits sous FACTS. Pas de suppositions, pas de connaissance externe.
-2) Pas de remplissage du type "ça a changé avec le temps", "ça préserve l'histoire", "fait intéressant:", "un rappel que...".
-3) Pas de superlatifs et pas de dramatisation.
-4) Safe pour des ados. Si FACTS mentionne un conflit ou une violence, reste bref et non-graphique.
-5) Un seul paragraphe. Pas de titre, pas de listes.
-6) Longueur: ${BTW_MIN_WORDS}-${BTW_MAX_WORDS} mots.
-7) Si FACTS ne suffit pas pour une histoire utile, retourne exactement: NO_STORY
-
-Structure:
-- 1-2 phrases pour situer: nom du lieu + distance.
-- 3-6 "beats" courts, chacun avec un fait concret (année, événement, nom).
-- 1 phrase de clôture qui revient à la route, sans poésie.
-
-Lieu: ${placeName}
-Distance: ${distanceText || "inconnue"}
-
-FACTS:
-${factsText || ""}
-
-Retourne seulement le texte final.
-`.trim();
-  }
-
-  // he
-  return `
-אתה כותב סיפורי BTW לנהיגה. תיצור סיפור קצר ומעניין על מקום קרוב.
-
-חוקים קשוחים:
-1) להשתמש רק בעובדות תחת FACTS. בלי לנחש, בלי להשלים ידע, בלי להמציא.
-2) בלי משפטי אוויר כמו "עבר שינויים", "משמר היסטוריה", "עובדה מעניינת:", "תזכורת ש...".
-3) בלי סופרלטיבים ובלי דרמה.
-4) בטוח לבני נוער. אם FACTS כולל סכסוך או אלימות, להזכיר בקצרה בלי תיאור גרפי.
-5) פסקה אחת בלבד. בלי כותרת, בלי רשימות.
-6) אורך: ${BTW_MIN_WORDS}-${BTW_MAX_WORDS} מילים.
-7) אם אין מספיק עובדות כדי לבנות סיפור משמעותי, תחזיר בדיוק: NO_STORY
-
-מבנה:
-- 1-2 משפטים שממקמים: שם המקום + מרחק.
-- 3-6 "ביטים" קצרים, כל אחד עם עובדה קונקרטית (שנה, אירוע, שם).
-- משפט סיום אחד שמחזיר לכביש, ענייני ולא מליצי.
-
-מקום: ${placeName}
-מרחק: ${distanceText || "לא ידוע"}
-
-FACTS:
-${factsText || ""}
-
-החזר רק את הסיפור הסופי.
-`.trim();
-}
-
-function normalizeFactLine(s) {
-  if (typeof s !== "string") return "";
-  const t = s.trim();
-  if (!t) return "";
-  return t.replace(/\s+/g, " ");
-}
-
-function buildFactsTextForModel({ language, poiName, distanceMetersApprox, facts }) {
-  const lines = [];
-  const name = poiName || "";
-  const dist = Number.isFinite(distanceMetersApprox) ? distanceMetersApprox : null;
-
-  if (language === "he") {
-    if (name) lines.push(`שם המקום: ${name}.`);
-    if (dist != null) lines.push(`מרחק מהנהג: בערך ${dist} מטר.`);
-  } else if (language === "fr") {
-    if (name) lines.push(`Nom du lieu: ${name}.`);
-    if (dist != null) lines.push(`Distance du conducteur: environ ${dist} mètres.`);
-  } else {
-    if (name) lines.push(`Place name: ${name}.`);
-    if (dist != null) lines.push(`Distance from the driver: about ${dist} meters.`);
-  }
-
-  const seen = new Set();
-  for (const f of Array.isArray(facts) ? facts : []) {
-    const x = normalizeFactLine(f);
-    if (!x) continue;
-    const k = x.toLowerCase();
-    if (seen.has(k)) continue;
-    seen.add(k);
-    lines.push(x);
-    if (lines.length >= 14) break;
-  }
-
-  return lines.join("\n");
-}
-
+// =======================
+// ===== Cache key =====
+// =======================
 function makeCacheKey(lat, lng, radiusMeters, mode = "interesting", language = "en") {
   const latKey = lat.toFixed(4);
   const lngKey = lng.toFixed(4);
   return `${mode}:${language}:${latKey},${lngKey},${radiusMeters}`;
 }
 
-// ===== Human distance formatting =====
+// =======================
+// ===== Distance =====
+// =======================
 function roundToNearest(n, step) {
   return Math.round(n / step) * step;
 }
@@ -240,6 +184,21 @@ function approxDistanceMeters(distanceMeters, stepMeters = 50) {
   return roundToNearest(d, step);
 }
 
+function distanceTextByLang(language, metersApprox) {
+  const m = Number.isFinite(metersApprox) ? metersApprox : null;
+  if (m == null) {
+    if (language === "fr") return "distance inconnue";
+    if (language === "en") return "unknown distance";
+    return "מרחק לא ידוע";
+  }
+  if (language === "fr") return `environ ${m} mètres`;
+  if (language === "en") return `about ${m} meters`;
+  return `בערך ${m} מטר`;
+}
+
+// =======================
+// ===== DB init =====
+// =======================
 async function initDb() {
   if (!pool) {
     console.warn("DB init skipped - no DATABASE_URL");
@@ -329,7 +288,9 @@ async function markPlaceHeardForUser(userKey, placeId) {
   }
 }
 
+// =======================
 // ===== Geo helpers =====
+// =======================
 function distanceMeters(lat1, lng1, lat2, lng2) {
   const R = 6371000;
   const toRad = (deg) => (deg * Math.PI) / 180;
@@ -351,12 +312,12 @@ function distanceMeters(lat1, lng1, lat2, lng2) {
 function abortableFetch(url, options, timeoutMs) {
   const controller = new AbortController();
   const t = setTimeout(() => controller.abort(), timeoutMs);
-  return fetch(url, { ...options, signal: controller.signal }).finally(() =>
-    clearTimeout(t)
-  );
+  return fetch(url, { ...options, signal: controller.signal }).finally(() => clearTimeout(t));
 }
 
+// =======================
 // ===== Source 1: Google Places (fallback) =====
+// =======================
 async function fetchNearbyPlacesFromGoogle(lat, lng, radiusMeters = 800) {
   if (!GOOGLE_PLACES_API_KEY) {
     throw new Error("GOOGLE_PLACES_API_KEY is not configured");
@@ -405,18 +366,22 @@ async function fetchNearbyPlacesFromGoogle(lat, lng, radiusMeters = 800) {
     address: p.shortFormattedAddress || "",
     source: "google_places",
     wikidataId: null,
+    wikipedia: null,
+    osmTags: null,
+    description: null,
   }));
 
   return places;
 }
 
+// =======================
 // ===== Source 2: OpenStreetMap via Overpass =====
+// =======================
 const OVERPASS_URL = "https://overpass-api.de/api/interpreter";
 
 function overpassQuery(lat, lng, radiusMeters) {
-  // Non-business POI focus
   return `
-[out:json][timeout:18];
+[out:json][timeout:20];
 (
   node(around:${radiusMeters},${lat},${lng})[historic];
   way(around:${radiusMeters},${lat},${lng})[historic];
@@ -437,8 +402,12 @@ function overpassQuery(lat, lng, radiusMeters) {
   node(around:${radiusMeters},${lat},${lng})[natural];
   way(around:${radiusMeters},${lat},${lng})[natural];
   relation(around:${radiusMeters},${lat},${lng})[natural];
+
+  node(around:${radiusMeters},${lat},${lng})[place];
+  way(around:${radiusMeters},${lat},${lng})[place];
+  relation(around:${radiusMeters},${lat},${lng})[place];
 );
-out center tags 80;
+out center tags 180;
 `.trim();
 }
 
@@ -449,12 +418,9 @@ function safeTag(tags, key) {
 }
 
 function nameFromWikipediaTag(wikipediaTag) {
-  // e.g. "he:הטכניון" or "en:Some_Title"
   if (typeof wikipediaTag !== "string") return "";
   const parts = wikipediaTag.split(":");
-  if (parts.length >= 2) {
-    return parts.slice(1).join(":").replaceAll("_", " ").trim();
-  }
+  if (parts.length >= 2) return parts.slice(1).join(":").replaceAll("_", " ").trim();
   return wikipediaTag.replaceAll("_", " ").trim();
 }
 
@@ -498,6 +464,7 @@ function osmElementToPoi(el) {
     safeTag(tags, "tourism") ||
     safeTag(tags, "natural") ||
     safeTag(tags, "memorial") ||
+    safeTag(tags, "place") ||
     "";
 
   return {
@@ -512,6 +479,7 @@ function osmElementToPoi(el) {
     wikidataId,
     wikipedia,
     osmTags: tags,
+    description: null,
   };
 }
 
@@ -524,11 +492,11 @@ async function fetchNearbyPoisFromOSM(lat, lng, radiusMeters = 800) {
       method: "POST",
       headers: {
         "Content-Type": "text/plain; charset=utf-8",
-        "User-Agent": "btw-ontheroad-server/1.0 (contact: none)",
+        "User-Agent": "btw-ontheroad-server/2.0 (contact: none)",
       },
       body: q,
     },
-    12000
+    14000
   );
 
   if (!resp.ok) {
@@ -551,10 +519,12 @@ async function fetchNearbyPoisFromOSM(lat, lng, radiusMeters = 800) {
     pois.push(poi);
   }
 
-  return pois.slice(0, 40);
+  return pois.slice(0, 60);
 }
 
+// =======================
 // ===== Source 3: Wikidata around via SPARQL =====
+// =======================
 const WIKIDATA_SPARQL = "https://query.wikidata.org/sparql";
 
 function qidFromEntityUrl(url) {
@@ -564,7 +534,7 @@ function qidFromEntityUrl(url) {
 }
 
 async function fetchNearbyPoisFromWikidata(lat, lng, radiusMeters = 800, language = "en") {
-  const radiusKm = Math.max(0.2, Math.min(5, radiusMeters / 1000));
+  const radiusKm = Math.max(0.2, Math.min(6, radiusMeters / 1000));
 
   const query = `
 SELECT ?item ?itemLabel ?itemDescription ?lat ?lon WHERE {
@@ -575,9 +545,9 @@ SELECT ?item ?itemLabel ?itemDescription ?lat ?lon WHERE {
   }
   BIND(geof:latitude(?location) AS ?lat)
   BIND(geof:longitude(?location) AS ?lon)
-  SERVICE wikibase:label { bd:serviceParam wikibase:language "${language},he,en". }
+  SERVICE wikibase:label { bd:serviceParam wikibase:language "${language},he,en,fr". }
 }
-LIMIT 35
+LIMIT 40
 `.trim();
 
   const url = `${WIKIDATA_SPARQL}?format=json&query=${encodeURIComponent(query)}`;
@@ -587,11 +557,11 @@ LIMIT 35
     {
       method: "GET",
       headers: {
-        "Accept": "application/sparql-results+json",
-        "User-Agent": "btw-ontheroad-server/1.0 (contact: none)",
+        Accept: "application/sparql-results+json",
+        "User-Agent": "btw-ontheroad-server/2.0 (contact: none)",
       },
     },
-    12000
+    13000
   );
 
   if (!resp.ok) {
@@ -626,6 +596,8 @@ LIMIT 35
       address: "",
       source: "wikidata",
       wikidataId: qid,
+      wikipedia: null,
+      osmTags: null,
       description: desc,
     });
   }
@@ -633,32 +605,36 @@ LIMIT 35
   return pois;
 }
 
-// ===== Wikidata facts pack (stronger) =====
-function toYearString(x) {
-  if (!x) return "";
-  if (typeof x === "string") return x;
-  return String(x);
-}
-
+// =======================
+// ===== Wikidata facts pack =====
+// =======================
 async function fetchWikidataFacts(qid, language = "en") {
   if (!qid) return { facts: [], sources: [], meta: {} };
 
-  const cacheKey = `${qid}|${language}`;
+  const cacheKey = `wd_facts:${qid}|${language}`;
   const cached = wikidataFactsMemory.get(cacheKey);
   if (cached) return cached;
 
-  // Pull: instance, description, inception year, named after, architect, heritage designation, significant event
   const query = `
-SELECT ?itemLabel ?itemDescription ?instanceLabel ?inceptionYear ?namedAfter ?namedAfterLabel ?architectLabel ?heritageLabel ?eventLabel WHERE {
+SELECT ?itemDescription
+       (GROUP_CONCAT(DISTINCT ?instanceLabel; separator=" | ") AS ?instances)
+       (GROUP_CONCAT(DISTINCT ?eventLabel; separator=" | ") AS ?events)
+       (MIN(?inceptionYear) AS ?inceptionYearMin)
+       (GROUP_CONCAT(DISTINCT ?namedAfterLabel; separator=" | ") AS ?namedAfter)
+       (GROUP_CONCAT(DISTINCT ?heritageLabel; separator=" | ") AS ?heritage)
+WHERE {
   BIND(wd:${qid} AS ?item)
+
   OPTIONAL { ?item wdt:P31 ?instance . }
+  OPTIONAL { ?item wdt:P793 ?event . }
   OPTIONAL { ?item wdt:P571 ?inception . BIND(YEAR(?inception) AS ?inceptionYear) }
   OPTIONAL { ?item wdt:P138 ?namedAfter . }
-  OPTIONAL { ?item wdt:P84 ?architect . }
   OPTIONAL { ?item wdt:P1435 ?heritage . }
-  OPTIONAL { ?item wdt:P793 ?event . }
-  SERVICE wikibase:label { bd:serviceParam wikibase:language "${language},he,en". }
+
+  SERVICE wikibase:label { bd:serviceParam wikibase:language "${language},he,en,fr". }
+  OPTIONAL { ?item schema:description ?itemDescription . FILTER(LANG(?itemDescription) = "${language}") }
 }
+GROUP BY ?itemDescription
 LIMIT 1
 `.trim();
 
@@ -670,16 +646,16 @@ LIMIT 1
       {
         method: "GET",
         headers: {
-          "Accept": "application/sparql-results+json",
-          "User-Agent": "btw-ontheroad-server/1.0 (contact: none)",
+          Accept: "application/sparql-results+json",
+          "User-Agent": "btw-ontheroad-server/2.0 (contact: none)",
         },
       },
-      12000
+      13000
     );
 
     if (!resp.ok) {
       const text = await resp.text();
-      console.error("Wikidata facts error:", resp.status, text.slice(0, 400));
+      console.error("Wikidata facts error:", resp.status, text.slice(0, 300));
       return { facts: [], sources: [], meta: {} };
     }
 
@@ -688,37 +664,30 @@ LIMIT 1
     if (!b) return { facts: [], sources: [], meta: {} };
 
     const desc = b.itemDescription?.value || "";
-    const instance = b.instanceLabel?.value || "";
-    const inceptionYear = b.inceptionYear?.value || "";
-    const namedAfterLabel = b.namedAfterLabel?.value || "";
-    const namedAfterQid = qidFromEntityUrl(b.namedAfter?.value) || "";
-    const architect = b.architectLabel?.value || "";
-    const heritage = b.heritageLabel?.value || "";
-    const event = b.eventLabel?.value || "";
+    const instances = (b.instances?.value || "").trim();
+    const events = (b.events?.value || "").trim();
+    const inceptionYear = b.inceptionYearMin?.value ? String(b.inceptionYearMin.value) : "";
+    const namedAfter = (b.namedAfter?.value || "").trim();
+    const heritage = (b.heritage?.value || "").trim();
 
     const facts = [];
     const meta = {
-      hasInstance: !!instance,
       hasDesc: !!desc,
+      hasInstances: !!instances,
       hasInception: !!inceptionYear,
-      hasNamedAfter: !!namedAfterLabel,
-      hasArchitect: !!architect,
+      hasEvents: !!events,
+      hasNamedAfter: !!namedAfter,
       hasHeritage: !!heritage,
-      hasEvent: !!event,
-      namedAfterQid: namedAfterQid || null,
     };
 
-    if (instance) facts.push(`Instance: ${instance}.`);
     if (desc) facts.push(`Description: ${desc}.`);
-    if (inceptionYear) facts.push(`Inception year: ${toYearString(inceptionYear)}.`);
-    if (namedAfterLabel) facts.push(`Named after: ${namedAfterLabel}.`);
-    if (architect) facts.push(`Architect: ${architect}.`);
+    if (instances) facts.push(`Type: ${instances}.`);
+    if (inceptionYear) facts.push(`Inception year: ${inceptionYear}.`);
+    if (namedAfter) facts.push(`Named after: ${namedAfter}.`);
     if (heritage) facts.push(`Heritage designation: ${heritage}.`);
-    if (event) facts.push(`Significant event: ${event}.`);
+    if (events) facts.push(`Notable event(s): ${events}.`);
 
-    const sources = [
-      { type: "wikidata", qid, url: `https://www.wikidata.org/wiki/${qid}` },
-    ];
+    const sources = [{ type: "wikidata", qid, url: `https://www.wikidata.org/wiki/${qid}` }];
 
     const result = { facts: facts.slice(0, 8), sources, meta };
     wikidataFactsMemory.set(cacheKey, result);
@@ -729,182 +698,9 @@ LIMIT 1
   }
 }
 
-async function fetchPersonFacts(personQid, language = "en") {
-  if (!personQid) return { facts: [], sources: [] };
-
-  const cacheKey = `person:${personQid}|${language}`;
-  const cached = wikidataFactsMemory.get(cacheKey);
-  if (cached) return cached;
-
-  const query = `
-SELECT ?personLabel
-       (GROUP_CONCAT(DISTINCT ?occupationLabel; separator=" | ") AS ?occupations)
-       (GROUP_CONCAT(DISTINCT ?positionLabel; separator=" | ") AS ?positions)
-       (GROUP_CONCAT(DISTINCT ?workLabel; separator=" | ") AS ?works)
-       (GROUP_CONCAT(DISTINCT ?awardLabel; separator=" | ") AS ?awards)
-       (GROUP_CONCAT(DISTINCT ?eduLabel; separator=" | ") AS ?education)
-       (GROUP_CONCAT(DISTINCT ?eventLabel; separator=" | ") AS ?events)
-       (MIN(?birthYear) AS ?birthYearMin)
-       (MIN(?deathYear) AS ?deathYearMin)
-WHERE {
-
-  BIND(wd:${personQid} AS ?person)
-
-  OPTIONAL { ?person wdt:P106 ?occupation . }
-  OPTIONAL { ?person wdt:P39 ?position . }
-  OPTIONAL { ?person wdt:P800 ?work . }
-  OPTIONAL { ?person wdt:P166 ?award . }
-  OPTIONAL { ?person wdt:P69 ?edu . }
-  OPTIONAL { ?person wdt:P793 ?event . }
-
-  OPTIONAL { ?person wdt:P569 ?birth . BIND(YEAR(?birth) AS ?birthYear) }
-  OPTIONAL { ?person wdt:P570 ?death . BIND(YEAR(?death) AS ?deathYear) }
-
-  SERVICE wikibase:label { bd:serviceParam wikibase:language "${language},he,en". }
-}
-GROUP BY ?personLabel
-LIMIT 1
-`.trim();
-
-  const url = `${WIKIDATA_SPARQL}?format=json&query=${encodeURIComponent(query)}`;
-
-  try {
-    const resp = await abortableFetch(
-      url,
-      {
-        method: "GET",
-        headers: {
-          "Accept": "application/sparql-results+json",
-          "User-Agent": "btw-ontheroad-server/1.0 (contact: none)",
-        },
-      },
-      12000
-    );
-
-    if (!resp.ok) return { facts: [], sources: [] };
-
-    const data = await resp.json();
-    const b = data?.results?.bindings?.[0];
-    if (!b) return { facts: [], sources: [] };
-
-    const personLabel = b.personLabel?.value || "";
-    const occupations = (b.occupations?.value || "").trim();
-    const positions = (b.positions?.value || "").trim();
-    const works = (b.works?.value || "").trim();
-    const awards = (b.awards?.value || "").trim();
-    const education = (b.education?.value || "").trim();
-    const events = (b.events?.value || "").trim();
-    const birthYear = b.birthYearMin?.value ? String(b.birthYearMin.value) : "";
-    const deathYear = b.deathYearMin?.value ? String(b.deathYearMin.value) : "";
-
-    const facts = [];
-    if (personLabel) facts.push(`Person: ${personLabel}.`);
-    if (occupations) facts.push(`Occupation(s): ${occupations}.`);
-    if (positions) facts.push(`Position(s) held: ${positions}.`);
-    if (works) facts.push(`Known for / notable work(s): ${works}.`);
-    if (awards) facts.push(`Award(s): ${awards}.`);
-    if (education) facts.push(`Education: ${education}.`);
-    if (events) facts.push(`Significant event(s): ${events}.`);
-    if (birthYear && deathYear) facts.push(`Lifespan: ${birthYear}-${deathYear}.`);
-    else if (birthYear) facts.push(`Birth year: ${birthYear}.`);
-
-    const sources = [
-      { type: "wikidata", qid: personQid, url: `https://www.wikidata.org/wiki/${personQid}` },
-    ];
-
-    const result = { facts: facts.slice(0, 8), sources };
-    wikidataFactsMemory.set(cacheKey, result);
-    return result;
-  } catch {
-    return { facts: [], sources: [] };
-  }
-}
-
-// ===== Wikipedia summary fallback (from OSM wikipedia tag OR Wikidata sitelinks) =====
-function parseWikipediaTag(wikipediaTag) {
-  // Returns {lang, title} or null
-  if (typeof wikipediaTag !== "string") return null;
-  const trimmed = wikipediaTag.trim();
-  if (!trimmed) return null;
-
-  // formats: "he:כותרת" or "en:Title_with_underscores"
-  const parts = trimmed.split(":");
-  if (parts.length >= 2) {
-    const lang = parts[0].trim().toLowerCase() || "en";
-    const title = parts.slice(1).join(":").trim().replaceAll(" ", "_");
-    if (!title) return null;
-    return { lang, title };
-  }
-
-  // Sometimes it's just a title, assume English
-  return { lang: "en", title: trimmed.replaceAll(" ", "_") };
-}
-
-async function fetchWikipediaSummaryByLangTitle(lang, title) {
-  if (!lang || !title) return { facts: [], sources: [] };
-
-  const url = `https://${lang}.wikipedia.org/api/rest_v1/page/summary/${encodeURIComponent(title)}`;
-
-  try {
-    const resp = await abortableFetch(
-      url,
-      {
-        method: "GET",
-        headers: {
-          "Accept": "application/json",
-          "User-Agent": "btw-ontheroad-server/1.0 (contact: none)",
-        },
-      },
-      9000
-    );
-
-    if (!resp.ok) return { facts: [], sources: [] };
-
-    const data = await resp.json();
-
-    const extract = typeof data.extract === "string" ? data.extract.trim() : "";
-    if (!extract) return { facts: [], sources: [] };
-
-    // Keep first 2 sentences only
-    const parts = extract.split(/(?<=[.!?])\s+/).filter(Boolean);
-    const short = parts.slice(0, 2).join(" ").trim();
-    if (!short) return { facts: [], sources: [] };
-
-    const titleHuman =
-      (typeof data.title === "string" && data.title.trim())
-        ? data.title.trim()
-        : title.replaceAll("_", " ");
-
-    const pageUrl =
-      (typeof data.content_urls?.desktop?.page === "string" && data.content_urls.desktop.page)
-        ? data.content_urls.desktop.page
-        : `https://${lang}.wikipedia.org/wiki/${title}`;
-
-    const facts = [
-      `Wikipedia page title: ${titleHuman}.`,
-      `Wikipedia summary: ${short}`,
-    ];
-
-    const sources = [{ type: "wikipedia", lang, title: titleHuman, url: pageUrl }];
-
-    return { facts: facts.slice(0, 3), sources };
-  } catch {
-    return { facts: [], sources: [] };
-  }
-}
-
-async function fetchWikipediaSummaryFacts(wikipediaTag, language = "en") {
-  const parsed = parseWikipediaTag(wikipediaTag);
-  if (!parsed) return { facts: [], sources: [] };
-
-  const langFromTag = parsed.lang || "";
-  const fallbackLang = language === "he" ? "he" : (language === "fr" ? "fr" : "en");
-  const lang = langFromTag || fallbackLang;
-  const title = parsed.title;
-
-  return fetchWikipediaSummaryByLangTitle(lang, title);
-}
-
+// =======================
+// ===== Wikidata -> Wikipedia sitelink title =====
+// =======================
 async function fetchWikipediaTitleFromWikidata(qid, preferredLang = "en") {
   if (!qid) return null;
 
@@ -920,8 +716,8 @@ async function fetchWikipediaTitleFromWikidata(qid, preferredLang = "en") {
       {
         method: "GET",
         headers: {
-          "Accept": "application/json",
-          "User-Agent": "btw-ontheroad-server/1.0 (contact: none)",
+          Accept: "application/json",
+          "User-Agent": "btw-ontheroad-server/2.0 (contact: none)",
         },
       },
       9000
@@ -933,25 +729,289 @@ async function fetchWikipediaTitleFromWikidata(qid, preferredLang = "en") {
     const entity = data?.entities?.[qid];
     const sitelinks = entity?.sitelinks || {};
 
-    const pref = preferredLang === "he" ? "hewiki" : (preferredLang === "fr" ? "frwiki" : "enwiki");
+    const pref = preferredLang === "he" ? "hewiki" : preferredLang === "fr" ? "frwiki" : "enwiki";
     const fallbacks = [pref, "hewiki", "enwiki", "frwiki"];
 
     for (const key of fallbacks) {
       const title = sitelinks?.[key]?.title;
       if (typeof title === "string" && title.trim()) {
-        const result = { lang: key === "hewiki" ? "he" : (key === "frwiki" ? "fr" : "en"), title };
+        const result = {
+          lang: key === "hewiki" ? "he" : key === "frwiki" ? "fr" : "en",
+          title: title.trim(),
+        };
         wikidataFactsMemory.set(cacheKey, result);
         return result;
       }
     }
-
     return null;
   } catch {
     return null;
   }
 }
 
+// =======================
+// ===== Wikipedia (full extract) =====
+// =======================
+// We use MediaWiki API to fetch plain text extract.
+// Then we pick candidate sentences and ask OpenAI to convert them to atomic facts.
+
+function parseWikipediaTag(wikipediaTag) {
+  // "he:כותרת" or "en:Title_with_underscores"
+  if (typeof wikipediaTag !== "string") return null;
+  const trimmed = wikipediaTag.trim();
+  if (!trimmed) return null;
+
+  const parts = trimmed.split(":");
+  if (parts.length >= 2) {
+    const lang = parts[0].trim().toLowerCase() || "en";
+    const title = parts.slice(1).join(":").trim();
+    if (!title) return null;
+    return { lang, title };
+  }
+
+  return { lang: "en", title: trimmed };
+}
+
+function wikiApiUrl(lang, params) {
+  const base = `https://${lang}.wikipedia.org/w/api.php`;
+  const usp = new URLSearchParams(params);
+  return `${base}?${usp.toString()}`;
+}
+
+async function fetchWikipediaPlainExtract(lang, title) {
+  const cacheKey = `wp_extract:${lang}|${title}`;
+  const cached = wikipediaExtractMemory.get(cacheKey);
+  if (cached) return cached;
+
+  const url = wikiApiUrl(lang, {
+    action: "query",
+    format: "json",
+    origin: "*",
+    redirects: "1",
+    prop: "extracts|info",
+    explaintext: "1",
+    exsectionformat: "plain",
+    exlimit: "1",
+    exintro: "0",
+    titles: title,
+    inprop: "url",
+  });
+
+  const resp = await abortableFetch(
+    url,
+    {
+      method: "GET",
+      headers: { "User-Agent": "btw-ontheroad-server/2.0 (contact: none)" },
+    },
+    12000
+  );
+
+  if (!resp.ok) return null;
+
+  const data = await resp.json();
+  const pages = data?.query?.pages || {};
+  const pageId = Object.keys(pages)[0];
+  const page = pages[pageId];
+  if (!page) return null;
+
+  const extract = typeof page.extract === "string" ? page.extract.trim() : "";
+  const titleHuman = typeof page.title === "string" ? page.title.trim() : title;
+  const fullurl = typeof page.fullurl === "string" ? page.fullurl : `https://${lang}.wikipedia.org/wiki/${encodeURIComponent(titleHuman)}`;
+
+  if (!extract) {
+    const out = { extract: "", titleHuman, url: fullurl };
+    wikipediaExtractMemory.set(cacheKey, out);
+    return out;
+  }
+
+  const out = { extract, titleHuman, url: fullurl };
+  wikipediaExtractMemory.set(cacheKey, out);
+  return out;
+}
+
+function splitToSentences(text) {
+  const t = normalizeSpaces(text);
+  if (!t) return [];
+  // decent split for he/en/fr
+  return t.split(/(?<=[.!?])\s+/).map((x) => x.trim()).filter(Boolean);
+}
+
+function pickWikipediaCandidateSentences(extract, lang) {
+  // We want lines with years, dates, numbers, named events, courts, wars, etc.
+  const sents = splitToSentences(extract);
+  const out = [];
+  const maxKeep = 28;
+
+  const yearRe = /\b(1[5-9]\d{2}|20\d{2})\b/;
+  const numberRe = /\b\d{2,}\b/;
+
+  const heSignals = ["ב-", "בשנת", "במאה", "במלחמת", "התקרית", "בית המשפט", "נהרג", "נפצע", "שוחרר", "נכנסו", "התגלו", "ממצאים", "ארכאולוגיים", "מסגד"];
+  const enSignals = ["in ", "in the", "war", "incident", "court", "killed", "wounded", "entered", "archaeolog", "discovered"];
+  const frSignals = ["en ", "guerre", "incident", "tribunal", "tué", "blessé", "entré", "archéolog", "découvert"];
+
+  const signals = lang === "he" ? heSignals : lang === "fr" ? frSignals : enSignals;
+
+  for (const s of sents) {
+    if (s.length < 25) continue;
+    if (s.length > 260) continue;
+
+    const hasYear = yearRe.test(s);
+    const hasNum = numberRe.test(s);
+    const hasSignal = signals.some((x) => s.includes(x));
+
+    if (hasYear || (hasNum && hasSignal) || hasSignal) {
+      out.push(s);
+      if (out.length >= maxKeep) break;
+    }
+  }
+
+  // fallback: if we got nothing, take first ~10 sentences
+  if (out.length === 0) return sents.slice(0, 10);
+
+  return out;
+}
+
+async function openaiExtractAtomicFactsFromWikipedia({ lang, titleHuman, pageUrl, candidateSentences }) {
+  const cacheKey = `wp_facts:${lang}|${titleHuman}`;
+  const cached = wikipediaFactsMemory.get(cacheKey);
+  if (cached) return cached;
+
+  const joined = candidateSentences.slice(0, 28).map((s, i) => `S${i + 1}: ${s}`).join("\n");
+
+  const sys =
+    lang === "he"
+      ? `
+אתה מחלץ עובדות מדויקות מתוך משפטים מוויקיפדיה.
+
+חוקים:
+- להשתמש רק במה שמופיע בקטעי המקור (S1..).
+- אסור להוסיף ידע מבחוץ ואסור לנחש.
+- להוציא "עובדות אטומיות": משפט אחד לכל עובדה, קצר, בלי סופרלטיבים ובלי ניסוחים מליציים.
+- אם יש אלימות או סכסוך, לציין בקצרה ולא גרפי.
+- להחזיר JSON בלבד במבנה: {"facts":[...]} עם 8 עד 14 עובדות.
+- אין לשכפל אותה עובדה בניסוח אחר.
+`.trim()
+      : lang === "fr"
+      ? `
+Tu extrais des faits exacts à partir de phrases Wikipedia.
+
+Règles:
+- Utilise uniquement ce qui apparaît dans les phrases sources (S1..).
+- Pas de connaissance externe, pas de suppositions.
+- Produis des "faits atomiques": une phrase courte par fait, sans superlatifs ni style poétique.
+- Si violence/conflit, reste bref et non-graphique.
+- Réponds en JSON uniquement: {"facts":[...]} avec 8 à 14 faits.
+- Pas de doublons.
+`.trim()
+      : `
+You extract exact facts from Wikipedia sentences.
+
+Rules:
+- Use only what appears in the source sentences (S1..).
+- No outside knowledge, no guessing.
+- Output atomic facts: one short sentence per fact, no hype.
+- If violence/conflict appears, mention briefly, non-graphic.
+- Return JSON only: {"facts":[...]} with 8 to 14 facts.
+- No duplicates.
+`.trim();
+
+  const user =
+    lang === "he"
+      ? `
+כותרת: ${titleHuman}
+מקור: ${pageUrl}
+
+משפטי מקור:
+${joined}
+`.trim()
+      : `
+Title: ${titleHuman}
+Source: ${pageUrl}
+
+Source sentences:
+${joined}
+`.trim();
+
+  const completion = await openai.chat.completions.create({
+    model: "gpt-4.1-mini",
+    messages: [
+      { role: "system", content: sys },
+      { role: "user", content: user },
+    ],
+    temperature: 0.1,
+    max_tokens: 650,
+    response_format: { type: "json_object" },
+  });
+
+  let facts = [];
+  try {
+    const raw = completion.choices[0]?.message?.content?.trim() || "";
+    const obj = JSON.parse(raw);
+    facts = Array.isArray(obj.facts) ? obj.facts.map((x) => normalizeSpaces(String(x))) : [];
+  } catch {
+    facts = [];
+  }
+
+  // minimal cleaning + dedupe
+  const seen = new Set();
+  const cleaned = [];
+  for (const f of facts) {
+    if (!f) continue;
+    const k = f.toLowerCase();
+    if (seen.has(k)) continue;
+    seen.add(k);
+    cleaned.push(f.endsWith(".") || f.endsWith("!") || f.endsWith("?") ? f : `${f}.`);
+    if (cleaned.length >= 14) break;
+  }
+
+  const result = {
+    facts: cleaned,
+    sources: [{ type: "wikipedia", lang, title: titleHuman, url: pageUrl }],
+    meta: { title: titleHuman, lang },
+  };
+
+  wikipediaFactsMemory.set(cacheKey, result);
+  return result;
+}
+
+async function getWikipediaFactsForPoi({ poi, language }) {
+  const lang = language === "he" ? "he" : language === "fr" ? "fr" : "en";
+
+  // priority 1: OSM wikipedia tag
+  let wp = null;
+  if (typeof poi?.wikipedia === "string" && poi.wikipedia.trim()) {
+    wp = parseWikipediaTag(poi.wikipedia);
+  }
+
+  // priority 2: Wikidata sitelink
+  if (!wp && poi?.wikidataId) {
+    const sl = await fetchWikipediaTitleFromWikidata(poi.wikidataId, lang);
+    if (sl && sl.title) wp = { lang: sl.lang || lang, title: sl.title };
+  }
+
+  if (!wp || !wp.title) return { facts: [], sources: [] };
+
+  const page = await fetchWikipediaPlainExtract(wp.lang, wp.title);
+  if (!page || !page.extract) return { facts: [], sources: page?.url ? [{ type: "wikipedia", lang: wp.lang, title: page.titleHuman, url: page.url }] : [] };
+
+  // limit extract size for processing
+  const extract = page.extract.slice(0, 12000);
+  const candidates = pickWikipediaCandidateSentences(extract, wp.lang);
+
+  // if candidates are too weak, still try but it may return few facts
+  const extracted = await openaiExtractAtomicFactsFromWikipedia({
+    lang: wp.lang,
+    titleHuman: page.titleHuman || wp.title,
+    pageUrl: page.url,
+    candidateSentences: candidates,
+  });
+
+  return extracted || { facts: [], sources: [] };
+}
+
+// =======================
 // ===== Unified POI retrieval + cache =====
+// =======================
 async function getNearbyPois(lat, lng, radiusMeters = 800, mode = "interesting", language = "en") {
   const key = makeCacheKey(lat, lng, radiusMeters, mode, language);
 
@@ -996,7 +1056,7 @@ async function getNearbyPois(lat, lng, radiusMeters = 800, mode = "interesting",
     pois = await fetchNearbyPlacesFromGoogle(lat, lng, radiusMeters);
   }
 
-  // de-dupe by name+coord (light)
+  // de-dupe by name+coord
   const seen = new Set();
   const deduped = [];
   for (const p of pois) {
@@ -1030,48 +1090,64 @@ async function getNearbyPois(lat, lng, radiusMeters = 800, mode = "interesting",
   return deduped;
 }
 
-// ===== Picking logic: prefer "fact density" over raw distance =====
-function computeFactScore(distanceM, factsMeta, factsCount) {
+// =======================
+// ===== Picking logic =====
+// =======================
+function scoreByDistance(distanceM) {
   const d = Number.isFinite(distanceM) ? distanceM : 999999;
-
-  // Base: closer is better
-  let score = d;
-
-  // Strong preference for items with concrete anchors
-  if (factsMeta?.hasNamedAfter) score -= 650;
-  if (factsMeta?.hasInception) score -= 350;
-  if (factsMeta?.hasEvent) score -= 650;
-  if (factsMeta?.hasHeritage) score -= 450;
-  if (factsMeta?.hasArchitect) score -= 250;
-
-  // More facts => better
-  score -= Math.min(6, Math.max(0, factsCount)) * 120;
-
-  return score;
+  return d;
 }
 
-function countHardAnchors(factsMeta) {
-  let n = 0;
-  if (factsMeta?.hasNamedAfter) n += 1;
-  if (factsMeta?.hasInception) n += 1;
-  if (factsMeta?.hasEvent) n += 1;
-  if (factsMeta?.hasHeritage) n += 1;
-  return n;
+function scoreBoostForFacts(facts) {
+  // more facts and more "anchor" facts => better
+  const f = Array.isArray(facts) ? facts : [];
+  const base = Math.min(20, f.length) * 80;
+
+  let anchors = 0;
+  for (const x of f) if (approxHasConcreteAnchor(x)) anchors += 1;
+
+  return base + clamp(anchors, 0, 10) * 220;
+}
+
+function mergeFactsDedup(a, b, limit = 20) {
+  const out = [];
+  const seen = new Set();
+
+  function pushOne(x) {
+    const s = normalizeSpaces(String(x || ""));
+    if (!s) return;
+    const k = s.toLowerCase();
+    if (seen.has(k)) return;
+    seen.add(k);
+    out.push(s.endsWith(".") || s.endsWith("!") || s.endsWith("?") ? s : `${s}.`);
+  }
+
+  for (const x of a || []) pushOne(x);
+  for (const x of b || []) pushOne(x);
+
+  return out.slice(0, limit);
+}
+
+function factsHaveStoryPotential(facts) {
+  // We require at least 1-2 anchored facts for "BTW quality"
+  const f = Array.isArray(facts) ? facts : [];
+  let anchors = 0;
+  for (const x of f) if (approxHasConcreteAnchor(x)) anchors += 1;
+  return f.length >= 10 && anchors >= 2;
 }
 
 async function pickBestPoiForUser(pois, lat, lng, userKey, language) {
   if (!pois || pois.length === 0) return null;
 
   const heardSet = await getHeardSetForUser(userKey);
-  const lang = language === "he" ? "he" : (language === "fr" ? "fr" : "en");
 
-  // Start with nearby + unseen candidates
+  // candidates within 2.2km and unseen
   const raw = [];
   for (const p of pois) {
     if (typeof p.lat !== "number" || typeof p.lng !== "number") continue;
 
     const d = distanceMeters(lat, lng, p.lat, p.lng);
-    if (d > 2000) continue;
+    if (d > 2200) continue;
 
     if (heardSet.has(p.id)) continue;
 
@@ -1087,80 +1163,41 @@ async function pickBestPoiForUser(pois, lat, lng, userKey, language) {
   raw.sort((a, b) => a.d - b.d);
 
   const enriched = [];
-  for (const c of raw.slice(0, 16)) {
+  for (const c of raw.slice(0, 18)) {
+    const poi = c.p;
     const qid = c.qid;
-    let facts = [];
-    let sources = [];
-    let meta = {};
 
+    let wdFacts = [];
+    let wdSources = [];
     if (qid) {
-      const r = await fetchWikidataFacts(qid, lang);
-      facts = r.facts || [];
-      sources = r.sources || [];
-      meta = r.meta || {};
-
-      // If we have "named after", pull basic person facts too
-      if (meta.namedAfterQid) {
-        const pr = await fetchPersonFacts(meta.namedAfterQid, lang);
-        if (Array.isArray(pr.facts) && pr.facts.length > 0) {
-          facts = facts.concat(pr.facts);
-          sources = sources.concat(pr.sources || []);
-        }
-      }
-    } else if (typeof c.p.description === "string" && c.p.description.trim().length > 0) {
-      facts = [`Description: ${c.p.description.trim()}.`];
-      sources = [];
-      meta = { hasDesc: true };
+      const wd = await fetchWikidataFacts(qid, language === "he" ? "he" : language === "fr" ? "fr" : "en");
+      wdFacts = Array.isArray(wd.facts) ? wd.facts : [];
+      wdSources = Array.isArray(wd.sources) ? wd.sources : [];
+    } else if (typeof poi.description === "string" && poi.description.trim()) {
+      wdFacts = [`Description: ${normalizeSpaces(poi.description)}.`];
     }
 
-    const hardAnchors = countHardAnchors(meta);
-    const factsCount = facts.length;
+    const wp = await getWikipediaFactsForPoi({ poi, language });
+    const wpFacts = Array.isArray(wp.facts) ? wp.facts : [];
+    const wpSources = Array.isArray(wp.sources) ? wp.sources : [];
 
-    // Quality gate:
-    // - at least 4 facts and at least 1 hard anchor, OR
-    // - at least 6 facts even without anchors.
-    let ok = (factsCount >= 4 && hardAnchors >= 1) || (factsCount >= 6);
+    const allFacts = mergeFactsDedup(wdFacts, wpFacts, 22);
+    const sources = [...wdSources, ...wpSources];
 
-    // If weak, try Wikipedia via OSM wikipedia tag
-    if (!ok) {
-      const wikiTag = typeof c.p.wikipedia === "string" ? c.p.wikipedia : null;
-      if (wikiTag) {
-        const wr = await fetchWikipediaSummaryFacts(wikiTag, lang);
-        if (Array.isArray(wr.facts) && wr.facts.length > 0) {
-          facts = facts.concat(wr.facts);
-          sources = sources.concat(wr.sources || []);
-        }
-      }
-      const factsCount2 = facts.length;
-      ok = (factsCount2 >= 3 && hardAnchors >= 1) || (factsCount2 >= 5);
-    }
-
-    // Still weak: try Wikidata sitelinks -> Wikipedia summary
-    if (!ok && qid) {
-      const sl = await fetchWikipediaTitleFromWikidata(qid, lang);
-      if (sl && sl.title) {
-        const wr2 = await fetchWikipediaSummaryByLangTitle(sl.lang, sl.title.replaceAll(" ", "_"));
-        if (Array.isArray(wr2.facts) && wr2.facts.length > 0) {
-          facts = facts.concat(wr2.facts);
-          sources = sources.concat(wr2.sources || []);
-        }
-      }
-      const factsCount3 = facts.length;
-      ok = (factsCount3 >= 3 && hardAnchors >= 1) || (factsCount3 >= 5);
-    }
-
+    // story quality gate: if too generic, skip
+    const ok = factsHaveStoryPotential(allFacts);
     if (!ok) continue;
 
-    const score = computeFactScore(c.d, meta, facts.length);
+    // scoring: distance minus boost
+    const s = scoreByDistance(c.d) - scoreBoostForFacts(allFacts);
 
     enriched.push({
-      p: c.p,
+      p: poi,
       d: c.d,
       qid,
-      facts: facts.slice(0, 12),
+      facts: allFacts,
       sources,
-      meta,
-      score,
+      score: s,
     });
   }
 
@@ -1170,49 +1207,219 @@ async function pickBestPoiForUser(pois, lat, lng, userKey, language) {
   return enriched[0];
 }
 
-// ===== System message: keep it controlled, story prompt carries most logic =====
+// =======================
+// ===== Story prompt =====
+// =======================
+function buildFactsBlock({ language, poiName, distanceText, facts }) {
+  const lines = [];
+
+  if (language === "he") {
+    if (poiName) lines.push(`שם המקום: ${poiName}.`);
+    if (distanceText) lines.push(`מרחק מהנהג: ${distanceText}.`);
+  } else if (language === "fr") {
+    if (poiName) lines.push(`Nom du lieu: ${poiName}.`);
+    if (distanceText) lines.push(`Distance du conducteur: ${distanceText}.`);
+  } else {
+    if (poiName) lines.push(`Place name: ${poiName}.`);
+    if (distanceText) lines.push(`Distance from the driver: ${distanceText}.`);
+  }
+
+  const f = Array.isArray(facts) ? facts : [];
+  for (let i = 0; i < Math.min(18, f.length); i += 1) {
+    lines.push(`FACT ${i + 1}: ${normalizeSpaces(f[i])}`);
+  }
+
+  return lines.join("\n");
+}
+
 function getSystemMessage(language) {
-  const lang = language === "he" ? "he" : (language === "fr" ? "fr" : "en");
+  const lang = language === "he" ? "he" : language === "fr" ? "fr" : "en";
 
-  if (lang === "en") {
+  if (lang === "he") {
     return `
-You are a careful driving-story writer.
+אתה כותב סיפורי BTW לנהיגה.
 
-Core rules:
-- Use ONLY the provided FACTS. If it is not in FACTS, do not state it.
-- No filler, no hype, no superlatives.
-- One paragraph, no headings, no lists.
-- Safe for teens. If facts mention violence, keep it brief and non-graphic.
-- If you cannot write a meaningful story from FACTS, output exactly: NO_STORY
+חוקי אמת:
+- משתמשים רק במה שמופיע תחת FACTS.
+- אסור להוסיף ידע מבחוץ, אסור לנחש, אסור להמציא.
+
+חוקי סגנון:
+- בלי מילוי, בלי סופרלטיבים, בלי משפטי "נוף" או "היסטוריה חיה", בלי עצות נהיגה כלליות.
+- אם FACTS כולל אלימות או סכסוך: להזכיר בקצרה וללא תיאור גרפי.
+- פסקה אחת בלבד. בלי כותרת. בלי רשימות.
+- כל משפט חייב לכלול לפחות עובדה קונקרטית (שנה, תאריך, מספר, שם, אירוע, מקום, גוף, מסלול).
+- אם אין מספיק עובדות לבניית סיפור טוב: להחזיר בדיוק NO_STORY.
 `.trim();
   }
 
   if (lang === "fr") {
     return `
-Tu es un rédacteur prudent d'histoires pour la conduite.
+Tu écris des histoires BTW pour la conduite.
 
-Règles:
-- Utilise UNIQUEMENT les FACTS fournis. Sinon, ne l'affirme pas.
-- Pas de remplissage, pas de hype, pas de superlatifs.
-- Un seul paragraphe, pas de titre, pas de listes.
-- Safe pour des ados. Si FACTS mentionne une violence, reste bref et non-graphique.
-- Si tu ne peux pas écrire une histoire utile à partir de FACTS, retourne exactement: NO_STORY
+Vérité:
+- Utilise uniquement FACTS.
+- Pas de connaissance externe, pas de suppositions.
+
+Style:
+- Pas de remplissage, pas de superlatifs, pas de conseils de conduite génériques.
+- Si conflit/violence: bref, non-graphique.
+- Un seul paragraphe. Pas de titre. Pas de listes.
+- Chaque phrase doit contenir au moins un fait concret (année, date, nombre, nom, événement, lieu).
+- Si FACTS ne suffit pas: retourne exactement NO_STORY.
 `.trim();
   }
 
   return `
-אתה כותב סיפורי נהיגה בזהירות.
+You write BTW driving stories.
 
-חוקים:
-- להשתמש רק ב-FACTS. אם פרט לא מופיע שם, אסור לקבוע אותו.
-- בלי מילוי, בלי דרמה, בלי סופרלטיבים.
-- פסקה אחת, בלי כותרות ובלי רשימות.
-- בטוח לבני נוער. אם FACTS כולל אלימות, לציין בקצרה בלי תיאור גרפי.
-- אם אי אפשר לכתוב סיפור שימושי מתוך FACTS, תחזיר בדיוק: NO_STORY
+Truth:
+- Use only FACTS.
+- No outside knowledge, no guessing.
+
+Style:
+- No filler, no superlatives, no generic driving advice.
+- If conflict/violence: brief and non-graphic.
+- One paragraph. No title. No lists.
+- Every sentence must include at least one concrete fact (year, date, number, name, event, place).
+- If FACTS are insufficient: output exactly NO_STORY.
 `.trim();
 }
 
-// ===== Debug: /places =====
+function buildBtwUserPrompt(language) {
+  if (language === "he") {
+    return `
+כתוב סיפור BTW אחד.
+
+מבנה חובה:
+- 1-2 משפטים ראשונים: שם המקום + המרחק (כמו ב-FACTS), וכניסה ישרה לעניין.
+- 5-9 משפטים קצרים: כל משפט עם עובדה אחרת, עדיף עם שנים/תאריכים/אירועים/גופים/שמות.
+- משפט סיום אחד: חייב להזכיר עובדה קונקרטית מתוך FACTS (לא עצת נהיגה כללית, לא קלישאה).
+
+חוקים:
+- פסקה אחת בלבד.
+- אורך: ${BTW_MIN_WORDS}-${BTW_MAX_WORDS} מילים.
+- אסור להשתמש בביטויים: "עובדה מעניינת", "עבר שינויים", "משמר היסטוריה", "תזכורת", "שמור על הערנות/קצב".
+- אם FACTS לא נותן לפחות 2 עובדות עם עוגן זמן (שנה/תאריך) או אירוע ברור: החזר NO_STORY.
+`.trim();
+  }
+
+  if (language === "fr") {
+    return `
+Écris une histoire BTW.
+
+Structure:
+- 1-2 premières phrases: nom du lieu + distance (comme dans FACTS), puis va droit au sujet.
+- 5-9 phrases courtes: chaque phrase avec un fait différent, de préférence avec années/dates/événements/noms.
+- 1 phrase finale: doit référencer un fait concret de FACTS (pas de conseil générique).
+
+Règles:
+- Un seul paragraphe.
+- Longueur: ${BTW_MIN_WORDS}-${BTW_MAX_WORDS} mots.
+- Si FACTS n'a pas au moins 2 faits ancrés (année/date) ou un événement clair: retourne NO_STORY.
+`.trim();
+  }
+
+  return `
+Write one BTW story.
+
+Structure:
+- First 1-2 sentences: place name + distance (as in FACTS), then jump straight in.
+- Next 5-9 short sentences: each with a different concrete fact, preferably with years/dates/events/names.
+- Final 1 sentence: must reference a concrete fact from FACTS (no generic driving advice).
+
+Rules:
+- One paragraph only.
+- Length: ${BTW_MIN_WORDS}-${BTW_MAX_WORDS} words.
+- If FACTS lacks at least 2 time-anchored facts (year/date) or a clear event: output NO_STORY.
+`.trim();
+}
+
+function validateStory({ story, language }) {
+  const w = countWordsHeuristic(story);
+  if (w < BTW_MIN_WORDS || w > BTW_MAX_WORDS) return { ok: false, reason: "bad_length", words: w };
+
+  if (language === "he") {
+    if (containsAny(story, BANNED_FILLER_HE)) return { ok: false, reason: "banned_filler", words: w };
+  } else {
+    if (containsAny(story.toLowerCase(), BANNED_FILLER_EN)) return { ok: false, reason: "banned_filler", words: w };
+  }
+
+  // one-paragraph heuristic: no double newlines
+  if (/\n\s*\n/.test(story)) return { ok: false, reason: "not_one_paragraph", words: w };
+
+  return { ok: true, reason: "ok", words: w };
+}
+
+async function generateBtwStoryFromFacts({ language, factsBlock }) {
+  const completion = await openai.chat.completions.create({
+    model: "gpt-4.1-mini",
+    messages: [
+      { role: "system", content: getSystemMessage(language) },
+      { role: "user", content: `${buildBtwUserPrompt(language)}\n\nFACTS:\n${factsBlock}` },
+    ],
+    temperature: 0.45,
+    max_tokens: 900,
+  });
+
+  return completion.choices[0]?.message?.content?.trim() || "";
+}
+
+async function repairStoryToComply({ language, factsBlock, badStory, failureReason }) {
+  const sys = getSystemMessage(language);
+
+  const user =
+    language === "he"
+      ? `
+יש טיוטה שלא עומדת בכללים (${failureReason}). תקן אותה כך שתעמוד בכל החוקים.
+
+חוקים:
+- להשתמש רק ב-FACTS.
+- פסקה אחת.
+- אורך ${BTW_MIN_WORDS}-${BTW_MAX_WORDS} מילים.
+- בלי מילוי וביטויי קלישאה, בלי עצות נהיגה כלליות.
+- כל משפט עם עובדה קונקרטית.
+- אם אי אפשר לתקן בלי להמציא: החזר NO_STORY.
+
+FACTS:
+${factsBlock}
+
+טיוטה:
+${badStory}
+`.trim()
+      : `
+The draft violates rules (${failureReason}). Rewrite to comply.
+
+Rules:
+- Use only FACTS.
+- One paragraph.
+- Length ${BTW_MIN_WORDS}-${BTW_MAX_WORDS}.
+- No filler, no generic driving advice.
+- Every sentence has a concrete fact.
+- If you cannot fix without inventing: output NO_STORY.
+
+FACTS:
+${factsBlock}
+
+Draft:
+${badStory}
+`.trim();
+
+  const completion = await openai.chat.completions.create({
+    model: "gpt-4.1-mini",
+    messages: [
+      { role: "system", content: sys },
+      { role: "user", content: user },
+    ],
+    temperature: 0.25,
+    max_tokens: 900,
+  });
+
+  return completion.choices[0]?.message?.content?.trim() || "";
+}
+
+// =======================
+// ===== /places debug =====
+// =======================
 app.get("/places", async (req, res) => {
   try {
     const { lat, lng, radius, mode, language } = req.query;
@@ -1221,7 +1428,7 @@ app.get("/places", async (req, res) => {
       return res.status(400).json({ error: "lat and lng query params are required" });
     }
 
-    const radiusMeters = radius ? Number(radius) : 800;
+    const radiusMeters = radius ? Number(radius) : 900;
     const m = typeof mode === "string" ? mode : "interesting";
     const lang = typeof language === "string" ? language : "en";
 
@@ -1233,15 +1440,16 @@ app.get("/places", async (req, res) => {
   }
 });
 
+// =======================
 // ===== Main API: /api/story-both =====
+// =======================
 app.post("/api/story-both", async (req, res) => {
   try {
-    const { prompt, lat, lng } = req.body;
+    const { lat, lng } = req.body;
     let { language } = req.body;
 
-    if (!prompt || typeof prompt !== "string") {
-      return res.status(400).json({ error: "Missing 'prompt' in request body (string required)" });
-    }
+    // prompt from client is ignored on purpose to keep BTW consistent
+    // (we still accept the field for backward compatibility)
 
     if (!language || typeof language !== "string") language = "he";
     language = language.toLowerCase();
@@ -1254,11 +1462,17 @@ app.post("/api/story-both", async (req, res) => {
     }
 
     // Expanding radii
-    const radii = [400, 800, 1500, 2200];
+    const radii = [500, 900, 1500, 2400];
     let best = null;
 
     for (const r of radii) {
-      const pois = await getNearbyPois(lat, lng, r, "interesting", language === "he" ? "he" : (language === "fr" ? "fr" : "en"));
+      const pois = await getNearbyPois(
+        lat,
+        lng,
+        r,
+        "interesting",
+        language === "he" ? "he" : language === "fr" ? "fr" : "en"
+      );
       best = await pickBestPoiForUser(pois, lat, lng, userKey, language);
       if (best) break;
     }
@@ -1270,39 +1484,43 @@ app.post("/api/story-both", async (req, res) => {
     const poi = best.p;
     const distExact = best.d;
     const distApprox = approxDistanceMeters(distExact, 50);
-    const distText = distApprox != null ? `${distApprox} מטר` : `${Math.round(distExact)} מטר`;
+    const distText = distanceTextByLang(language, distApprox);
 
-    // Facts for model
-    const facts = Array.isArray(best.facts) ? best.facts : [];
-    const factsText = buildFactsTextForModel({
+    const factsBlock = buildFactsBlock({
       language,
       poiName: poi.name,
-      distanceMetersApprox: distApprox,
-      facts,
+      distanceText: distText,
+      facts: best.facts || [],
     });
 
-    const btwPrompt = buildBtwPrompt({
-      languageCode: language,
-      poiName: poi.name,
-      distanceText: language === "he" ? distText : (language === "fr" ? distText.replace("מטר", "mètres") : distText.replace(" מטר", " meters")),
-      factsText,
-    });
+    // 1st pass
+    let storyText = await generateBtwStoryFromFacts({ language, factsBlock });
 
-    const completion = await openai.chat.completions.create({
-      model: "gpt-4.1-mini",
-      messages: [
-        { role: "system", content: getSystemMessage(language) },
-        { role: "user", content: btwPrompt },
-      ],
-      temperature: 0.4,
-      max_tokens: 650,
-    });
-
-    const storyText = completion.choices[0]?.message?.content?.trim();
     if (!storyText) throw new Error("No story generated by OpenAI");
-
     if (storyText === "NO_STORY") {
       return res.json({ shouldSpeak: false, reason: "model_no_story", language });
+    }
+
+    // validate + optional repair pass
+    const v1 = validateStory({ story: storyText, language });
+    if (!v1.ok) {
+      const repaired = await repairStoryToComply({
+        language,
+        factsBlock,
+        badStory: storyText,
+        failureReason: v1.reason,
+      });
+
+      if (repaired === "NO_STORY") {
+        return res.json({ shouldSpeak: false, reason: `repair_failed_${v1.reason}`, language });
+      }
+
+      const v2 = validateStory({ story: repaired, language });
+      if (!v2.ok) {
+        // if still not good, go silent instead of shipping boring/invalid
+        return res.json({ shouldSpeak: false, reason: `final_validation_failed_${v2.reason}`, language });
+      }
+      storyText = repaired;
     }
 
     const { audioBase64, voiceId, voiceIndex, voiceKey } = await ttsWithOpenAI(storyText, language);
@@ -1322,6 +1540,9 @@ app.post("/api/story-both", async (req, res) => {
       poiSource: poi.source,
       distanceMetersApprox: distApprox,
       sources: Array.isArray(best.sources) ? best.sources : [],
+      debug: {
+        factsCount: Array.isArray(best.facts) ? best.facts.length : 0,
+      },
     });
   } catch (err) {
     console.error("Error in /api/story-both:", err);
@@ -1333,7 +1554,7 @@ app.post("/api/story-both", async (req, res) => {
 app.get("/health", (req, res) => {
   res.json({
     status: "ok",
-    build: "btw-better-storyprompt-words190-wiki-sitelink-fallback-tts-v2",
+    build: "btw-wikipedia-deep-facts-words340-repairpass-v3",
   });
 });
 
