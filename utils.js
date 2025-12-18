@@ -17,10 +17,33 @@ export function nowIso() {
   return new Date().toISOString();
 }
 
+export function clamp(v, min, max) {
+  const n = typeof v === "number" ? v : Number(v);
+  if (!Number.isFinite(n)) return min;
+  return Math.min(max, Math.max(min, n));
+}
+
 export function safeTrim(s, maxLen = 400) {
   const str = String(s ?? "");
   if (str.length <= maxLen) return str;
   return str.slice(0, maxLen);
+}
+
+export function sanitizeForTts(text, lang = "en") {
+  // Keep it simple: remove control chars, normalize whitespace, trim.
+  // Do NOT delete punctuation aggressively - TTS needs it for prosody.
+  let s = String(text ?? "");
+
+  // remove control chars except \n and \t
+  s = s.replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001F]/g, "");
+
+  // collapse whitespace
+  s = s.replace(/\s+/g, " ").trim();
+
+  // Optional: limit super-long runs
+  s = safeTrim(s, 4000);
+
+  return s;
 }
 
 export function makeLogger(prefix) {
