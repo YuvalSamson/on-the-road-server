@@ -27,7 +27,7 @@ export async function synthesizeTts(text, opts = {}) {
   requireOpenAIKey();
 
   const cleaned = sanitizeForTts(safeTrim(text, 3900), {
-    disallowSexualContent: config.safety.disallowSexualContent,
+    disallowSexualContent: (config.safety?.disallowSexualContent ?? true),
   });
   if (!cleaned) throw new HttpError(400, "Empty TTS text after sanitization");
 
