@@ -2,12 +2,16 @@
  * storyService.js (ESM)
  * Generates the spoken micro-story text.
  *
- * Goals:
- * - Respect requested language (he/en/fr)
- * - Avoid hot-button topics (e.g., 1948, conflict/politics/ethnic/religious tension)
- * - Add "BTW vibe": short, punchy, lightly witty (not forced), one sensory detail
- * - Add a personal-life detail about a notable person ONLY if it exists in the provided facts
- * - No hallucinations: do not invent facts
+ * Updated goal (per your request):
+ * - Not just history: enrich every story with 1 short "general knowledge" nugget
+ *   from domains like sports, music, architecture, life science, exact science,
+ *   technology, nature, medicine, food, etc.
+ *
+ * IMPORTANT:
+ * - No hallucinations about the place.
+ * - The general-knowledge nugget must be clearly generic (not claimed about this exact POI)
+ *   unless it is explicitly supported by provided facts.
+ * - Avoid hot-button topics (politics/conflict/war/ethnic-religious tension).
  *
  * Env:
  * - OPENAI_API_KEY (required)
@@ -40,7 +44,7 @@ function targetLanguageName(lang) {
 function isSensitiveFactLine(line) {
   const s = String(line || "").toLowerCase();
 
-  // Keep this intentionally strict: if it smells like conflict/politics/violence, drop it.
+  // Strict filter: if it smells like conflict/politics/violence, drop it.
   const patterns = [
     /1948/,
     /\bnakba\b/,
@@ -64,7 +68,7 @@ function isSensitiveFactLine(line) {
   return patterns.some((re) => re.test(s));
 }
 
-function takeFacts(poi, max = 8) {
+function takeFacts(poi, max = 10) {
   const facts = Array.isArray(poi?.facts) ? poi.facts : [];
   return facts
     .map((f) => (typeof f === "string" ? f.trim() : ""))
@@ -74,8 +78,7 @@ function takeFacts(poi, max = 8) {
 }
 
 function pickPersonalLifeFacts(facts) {
-  // We only allow personal-life flavor if it's explicitly in facts.
-  // Heuristics: look for "born", "married", "wife", "husband", "children", "grew up", Hebrew equivalents.
+  // Personal-life flavor ONLY if explicitly present in facts.
   const patterns = [
     /\bborn\b/i,
     /\bmarried\b/i,
@@ -97,12 +100,33 @@ function pickPersonalLifeFacts(facts) {
   ];
 
   const hits = facts.filter((f) => patterns.some((re) => re.test(f)));
-  return hits.slice(0, 2);
+  return hits.slice(0, 1);
 }
 
 function formatFactsBlock(facts) {
   if (!facts.length) return "(no strong facts)";
   return facts.map((f, i) => `${i + 1}. ${f}`).join("\n");
+}
+
+function weakFactsFallback({ poiName, lang }) {
+  const l = normalizeLang(lang);
+
+  if (l === "he") {
+    return safeTrim(
+      `עצרנו ליד ${poiName}. כרגע אין לי מספיק עובדות חזקות על המקום כדי לספר משהו מדויק, ואני מעדיף לדייק מאשר לייפות. תן לי נקודת עניין קרובה אחרת, ואני אנסה שוב.`,
+      1400
+    );
+  }
+  if (l === "fr") {
+    return safeTrim(
+      `On est près de ${poiName}. Pour l'instant je n'ai pas assez de faits solides pour raconter quelque chose de précis, et je préfère être exact plutôt que faire du remplissage. Essaie un point d'intérêt juste à côté et je réessaie.`,
+      1400
+    );
+  }
+  return safeTrim(
+    `We’re near ${poiName}. Right now I don’t have enough solid facts to tell a precise story, and I’d rather be accurate than fill space. Try a nearby point of interest and I’ll take another shot.`,
+    1400
+  );
 }
 
 async function openaiChat({ system, user }) {
@@ -113,7 +137,7 @@ async function openaiChat({ system, user }) {
 
   const payload = {
     model,
-    temperature: 0.7,
+    temperature: 0.55,
     messages: [
       { role: "system", content: system },
       { role: "user", content: user },
@@ -139,9 +163,6 @@ async function openaiChat({ system, user }) {
   return String(text);
 }
 
-/**
- * Public API used by server.js
- */
 export async function generateStoryText({ poi, taste, lang = "en" }) {
   const l = normalizeLang(lang);
   const languageName = targetLanguageName(l);
@@ -150,29 +171,38 @@ export async function generateStoryText({ poi, taste, lang = "en" }) {
   const poiDesc = poi?.description || "";
   const wiki = poi?.wikipediaUrl || "";
 
-  const facts = takeFacts(poi, 8);
-  const personalHints = pickPersonalLifeFacts(facts);
+  const facts = takeFacts(poi, 10);
+  const personalHint = pickPersonalLifeFacts(facts);
 
-  // Taste is optional. Keep it safe and lightweight.
-  const humor = Number(taste?.humor ?? 0.6);
+  // If we do not have enough facts, do NOT freestyle.
+  if (facts.length < 2) {
+    return weakFactsFallback({ poiName, lang: l });
+  }
+
+  const humor = Number(taste?.humor ?? 0.55);
 
   const system = [
-    `You write short micro-stories for a travel app named BYTHEWAY.`,
+    `You write micro-stories for a travel app named BYTHEWAY.`,
     `Output language must be ${languageName}. Do not mix languages.`,
-    `Safety and tone rules:`,
-    `- Keep it clean and teen-safe: no sexual content, no explicit violence, no hate.`,
-    `- Avoid hot-button topics: no politics, no conflict/war, no ethnic/religious tension, no historical controversy.`,
-    `- If the provided facts contain such topics, ignore them. Do not mention years like 1948.`,
-    `Style rules (BYTHEWAY):`,
-    `- 70-130 words.`,
-    `- Hook in the first sentence (question or surprising angle).`,
-    `- Include exactly 1 gentle, understated smile-worthy line (not a forced metaphor).`,
-    `- Include 1 sensory detail (sound/smell/texture/heat/wind).`,
-    `- No generic closings like "every place has a story". No lecturing.`,
-    `- Facts must be grounded ONLY in the provided facts. Do not invent.`,
-    `Personal "juice" rule:`,
-    `- If there is a notable person personal-life detail in the provided facts, include ONE such detail.`,
-    `- If not present, do NOT invent; skip it.`,
+    `Hard rules:`,
+    `- NO politics, NO conflict/war, NO ethnic/religious tension, NO controversy. Ignore sensitive facts if present.`,
+    `- Use ONLY the provided facts for anything that sounds place-specific.`,
+    `- Do not invent streets, buildings, vibes, history, or claims about the place.`,
+    `- Do not add city/region names unless they appear in the provided facts.`,
+    `Style (BYTHEWAY):`,
+    `- 80-140 words total.`,
+    `- First sentence is a sharp hook, not poetic.`,
+    `- Include 2 to 4 concrete facts from the list (paraphrase ok).`,
+    `- Include exactly 1 gentle, understated smile-worthy line (simple, not forced).`,
+    `- Avoid metaphors and clichés like "time stops", "secrets of the past", "each wall tells a story".`,
+    `Knowledge enrichment (your new requirement):`,
+    `- Add exactly 1 short "general knowledge" nugget (1 sentence) that teaches something.`,
+    `- Choose ONE domain that best matches the facts: sports, music, architecture, life science, exact science, technology, nature, medicine, food, or art.`,
+    `- The nugget MUST be clearly generic (not claimed about this place) unless directly supported by the provided facts.`,
+    `- Keep medicine informational only: no advice, no diagnosis, no instructions.`,
+    `Personal "juice":`,
+    `- If a personal-life fact about a notable person is provided, include exactly one.`,
+    `- If not provided, do not add any personal details.`,
     `Formatting: plain text, no bullets, no emojis.`,
   ].join(" ");
 
@@ -180,10 +210,12 @@ export async function generateStoryText({ poi, taste, lang = "en" }) {
     `Place name: ${poiName}`,
     poiDesc ? `Description: ${poiDesc}` : "",
     wiki ? `Wikipedia: ${wiki}` : "",
-    `Facts (sanitized):`,
+    `Facts:`,
     formatFactsBlock(facts),
-    personalHints.length ? `Personal-life fact hints (use at most one):\n${formatFactsBlock(personalHints)}` : `Personal-life fact hints: (none provided)`,
-    `Humor level (0-1): ${Number.isFinite(humor) ? humor : 0.6}`,
+    personalHint.length
+      ? `Personal-life fact (use exactly one if relevant):\n${formatFactsBlock(personalHint)}`
+      : `Personal-life fact: (none provided)`,
+    `Humor level (0-1): ${Number.isFinite(humor) ? humor : 0.55}`,
     `Write the story now.`,
   ]
     .filter(Boolean)
