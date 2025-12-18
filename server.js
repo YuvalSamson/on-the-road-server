@@ -88,8 +88,14 @@ app.post("/api/story-both", async (req, res) => {
         reason: poiPick.reason,
         distanceMetersApprox: poiPick.distanceMetersApprox ?? null,
         poi: poiPick.poi ?? null,
+
+        // Backward compatibility for the app:
         text: "",
         storyText: "",
+        audioBase64: "",
+        audioContentType: "",
+
+        // New structured audio (optional for client):
         audio: null,
       });
     }
@@ -99,6 +105,7 @@ app.post("/api/story-both", async (req, res) => {
 
     const audioBuf = await synthesizeTts(storyText);
     const audioBase64 = audioToBase64(audioBuf);
+    const audioContentType = getTtsContentType();
 
     await logStory({
       userId,
@@ -131,15 +138,19 @@ app.post("/api/story-both", async (req, res) => {
       },
       facts: (poi.facts || []).slice(0, 6),
 
-      // IMPORTANT: keep both keys for backward compatibility with the app
+      // Backward compatibility for the app:
       text: storyText,
       storyText,
+      audioBase64,
+      audioContentType,
 
+      // New structured audio (optional for client):
       audio: {
-        contentType: getTtsContentType(),
+        contentType: audioContentType,
         base64: audioBase64,
         bytes: audioBuf.length,
       },
+
       timingMs: ms,
     });
   } catch (err) {
@@ -149,8 +160,10 @@ app.post("/api/story-both", async (req, res) => {
       err?.message,
       err?.details || ""
     );
+
     const status =
       err?.status && Number.isFinite(err.status) ? err.status : 500;
+
     return res.status(status).json({
       version: config.version,
       error: err?.message || "Server error",
@@ -182,9 +195,13 @@ app.post("/api/taste/feedback", async (req, res) => {
     const updated = applyFeedback(taste, feedback);
     await saveTasteProfile(tpId, updated);
 
-    return res.status(200).json({ ok: true, tasteProfileId: tpId, taste: updated });
+    return res
+      .status(200)
+      .json({ ok: true, tasteProfileId: tpId, taste: updated });
   } catch (err) {
-    return res.status(500).json({ ok: false, error: err?.message || "Server error" });
+    return res
+      .status(500)
+      .json({ ok: false, error: err?.message || "Server error" });
   }
 });
 
@@ -205,7 +222,9 @@ app.post("/api/taste/set", async (req, res) => {
 
     return res.status(200).json({ ok: true, tasteProfileId, taste });
   } catch (err) {
-    return res.status(500).json({ ok: false, error: err?.message || "Server error" });
+    return res
+      .status(500)
+      .json({ ok: false, error: err?.message || "Server error" });
   }
 });
 
