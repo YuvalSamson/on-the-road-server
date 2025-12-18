@@ -1,195 +1,210 @@
 /**
- * Wikidata + Wikipedia + Overpass fallback services (ESM).
+ * wikiService.js (ESM)
  *
- * Primary flow:
- * 1) Query Wikidata SPARQL for nearby entities.
- * 2) For the best candidates, fetch a short Wikipedia summary (if an enwiki link exists).
+ * Minimal Wikidata-based helper to extract safe, non-controversial facts
+ * for a person name (for street-name anchoring).
  *
- * Fallback flow:
- * - Query Overpass for OSM objects with a wikipedia tag around the location
- * - Pull Wikipedia summaries for those titles
+ * We explicitly filter out political/war/conflict sensitive stuff.
  */
+
 import { config } from "./config.js";
-import { HttpError, jsonOk, safeTrim, sleep } from "./utils.js";
+import {
+  HttpError,
+  cacheGet,
+  cacheSet,
+  fetchJson,
+  normalizeWhitespace,
+  looksLikePersonName,
+  safeTrim,
+} from "./utils.js";
 
-const SPARQL_ENDPOINT = "https://query.wikidata.org/sparql";
-const WIKI_SUMMARY_BASE = "https://en.wikipedia.org/api/rest_v1/page/summary/";
-const OVERPASS_ENDPOINT = "https://overpass-api.de/api/interpreter";
-
-function userAgent() {
-  return "BTW/1.0 (contact: you@example.com)";
+function normalizeLang(lang) {
+  const v = String(lang || "en").toLowerCase();
+  if (v.startsWith("he")) return "he";
+  if (v.startsWith("fr")) return "fr";
+  if (v.startsWith("en")) return "en";
+  return v.slice(0, 5);
 }
 
-export async function queryWikidataNearby({ lat, lng, radiusMeters, limit }) {
-  const r = radiusMeters ?? config.wikidataRadiusMeters;
-  const lim = limit ?? config.wikidataLimit;
-
-  // Note: SERVICE wikibase:around provides distance in kilometers by default via wikibase:distance
-  const sparql = `
-    SELECT ?item ?itemLabel ?itemDescription ?article ?image ?dist WHERE {
-      SERVICE wikibase:around {
-        ?item wdt:P625 ?location .
-        bd:serviceParam wikibase:center "Point(${lng} ${lat})"^^geo:wktLiteral .
-        bd:serviceParam wikibase:radius "${(r / 1000).toFixed(3)}" .
-        bd:serviceParam wikibase:distance ?dist .
-      }
-      OPTIONAL { ?article schema:about ?item ;
-                        schema:isPartOf <https://en.wikipedia.org/> . }
-      OPTIONAL { ?item wdt:P18 ?image . }
-      SERVICE wikibase:label { bd:serviceParam wikibase:language "en". }
-    }
-    ORDER BY ?dist
-    LIMIT ${lim}
-  `.trim();
-
-  const url = `${SPARQL_ENDPOINT}?format=json&query=${encodeURIComponent(sparql)}`;
-
-  const res = await fetch(url, {
-    headers: {
-      "Accept": "application/sparql-results+json",
-      "User-Agent": userAgent(),
-    },
-  });
-
-  if (!res.ok) throw new HttpError(res.status, "Wikidata SPARQL failed");
-
-  const data = await res.json().catch(() => null);
-  if (!data?.results?.bindings) return [];
-
-  return data.results.bindings.map((b) => {
-    const itemUrl = b.item?.value || "";
-    const qid = itemUrl.split("/").pop() || "";
-    const label = b.itemLabel?.value || "";
-    const desc = b.itemDescription?.value || "";
-    const article = b.article?.value || "";
-    const image = b.image?.value || "";
-    const distKm = Number(b.dist?.value || "9999");
-    return {
-      source: "wikidata",
-      key: qid ? `wd:${qid}` : itemUrl,
-      qid,
-      label,
-      description: desc,
-      wikipediaUrl: article || null,
-      imageUrl: image || null,
-      distanceMetersApprox: Math.round(distKm * 1000),
-    };
-  });
+function isSensitiveDescription(desc) {
+  const s = String(desc || "").toLowerCase();
+  const bad = [
+    "politician",
+    "politics",
+    "minister",
+    "president",
+    "prime minister",
+    "terror",
+    "war",
+    "military",
+    "conflict",
+    "כיבוש",
+    "פוליטיקאי",
+    "פוליטיקה",
+    "שר ",
+    "נשיא",
+    "ראש ממשלה",
+    "מלחמה",
+    "צבא",
+    "טרור",
+  ];
+  return bad.some((w) => s.includes(w));
 }
 
-export async function fetchWikipediaSummaryByUrl(wikipediaUrl) {
-  if (!wikipediaUrl) return null;
-  try {
-    const u = new URL(wikipediaUrl);
-    const title = u.pathname.split("/").pop() || "";
-    return await fetchWikipediaSummaryByTitle(decodeURIComponent(title));
-  } catch {
-    return null;
+function safeFactLine(s) {
+  const t = normalizeWhitespace(s);
+  if (!t) return "";
+  // avoid 1948 and similar hot-button years
+  if (/\b1948\b/.test(t)) return "";
+  if (/נכבה|מלחמ|כיבוש|טרור|טבח|רצח|נהרג/.test(t)) return "";
+  return t;
+}
+
+function pickFirstString(arr) {
+  if (!Array.isArray(arr)) return "";
+  for (const x of arr) {
+    if (typeof x === "string" && x.trim()) return x.trim();
   }
+  return "";
 }
 
-export async function fetchWikipediaSummaryByTitle(title) {
-  const t = safeTrim(title, 200);
-  if (!t) return null;
-
-  const url = `${WIKI_SUMMARY_BASE}${encodeURIComponent(t)}`;
-  const res = await fetch(url, {
-    headers: {
-      "Accept": "application/json",
-      "User-Agent": userAgent(),
-    },
-  });
-
-  if (!res.ok) return null;
-  if (!jsonOk(res)) return null;
-
-  const data = await res.json().catch(() => null);
-  if (!data) return null;
-
-  return {
-    title: data.title || t,
-    extract: data.extract || "",
-    description: data.description || "",
-    thumbnail: data.thumbnail?.source || null,
-    pageUrl: data.content_urls?.desktop?.page || null,
-  };
+function getClaim(entity, pid) {
+  const claims = entity?.claims?.[pid];
+  if (!Array.isArray(claims) || !claims.length) return null;
+  return claims[0]?.mainsnak?.datavalue?.value ?? null;
 }
 
-export async function queryOverpassWikipediaTagged({ lat, lng, radiusMeters }) {
-  const r = radiusMeters ?? config.overpassRadiusMeters;
+function getTimeString(timeObj) {
+  // Wikidata time format: { time: "+1879-03-14T00:00:00Z", ... }
+  const t = timeObj?.time;
+  if (!t) return "";
+  const m = String(t).match(/([0-9]{4})-([0-9]{2})-([0-9]{2})/);
+  if (!m) return "";
+  return `${m[1]}-${m[2]}-${m[3]}`;
+}
 
-  const q = `
-    [out:json][timeout:20];
-    (
-      node(around:${r},${lat},${lng})["wikipedia"];
-      way(around:${r},${lat},${lng})["wikipedia"];
-      relation(around:${r},${lat},${lng})["wikipedia"];
-    );
-    out tags center 25;
-  `.trim();
+async function wikidataSearch(name, lang) {
+  const l = normalizeLang(lang);
+  const url =
+    "https://www.wikidata.org/w/api.php" +
+    `?action=wbsearchentities&search=${encodeURIComponent(name)}` +
+    `&language=${encodeURIComponent(l)}` +
+    `&format=json&limit=5&origin=*`;
 
-  const res = await fetch(OVERPASS_ENDPOINT, {
-    method: "POST",
-    headers: {
-      "Content-Type": "text/plain;charset=UTF-8",
-      "User-Agent": userAgent(),
-    },
-    body: q,
-  });
+  const r = await fetchJson(url, { timeoutMs: config.httpTimeoutMs });
+  if (!r.ok || !r.json) return [];
+  return Array.isArray(r.json.search) ? r.json.search : [];
+}
 
-  if (!res.ok) return [];
+async function wikidataEntity(qid) {
+  const url = `https://www.wikidata.org/wiki/Special:EntityData/${encodeURIComponent(qid)}.json`;
+  const r = await fetchJson(url, { timeoutMs: config.httpTimeoutMs });
+  if (!r.ok || !r.json) return null;
 
-  const data = await res.json().catch(() => null);
-  const els = data?.elements || [];
-  const out = [];
+  const ent = r.json?.entities?.[qid];
+  return ent || null;
+}
 
-  for (const el of els) {
-    const wikiTag = el.tags?.wikipedia;
-    if (!wikiTag) continue;
+function labelFor(entity, lang) {
+  const l = normalizeLang(lang);
+  return (
+    entity?.labels?.[l]?.value ||
+    entity?.labels?.en?.value ||
+    entity?.labels?.he?.value ||
+    entity?.labels?.fr?.value ||
+    ""
+  );
+}
 
-    // Common formats: "en:Title", "Title"
-    const parts = String(wikiTag).split(":");
-    const lang = parts.length > 1 ? parts[0] : "en";
-    const title = parts.length > 1 ? parts.slice(1).join(":") : parts[0];
+function descFor(entity, lang) {
+  const l = normalizeLang(lang);
+  return (
+    entity?.descriptions?.[l]?.value ||
+    entity?.descriptions?.en?.value ||
+    entity?.descriptions?.he?.value ||
+    entity?.descriptions?.fr?.value ||
+    ""
+  );
+}
 
-    if (lang !== "en") continue;
+export async function tryPersonFactsFromName(name, lang) {
+  const n = normalizeWhitespace(name);
+  if (!looksLikePersonName(n)) return { ok: false, facts: [], person: null };
 
-    out.push({
-      source: "osm",
-      key: `osm:${el.type}:${el.id}`,
-      label: el.tags?.name || title,
-      wikipediaTitle: title,
-      lat: el.lat ?? el.center?.lat ?? null,
-      lng: el.lon ?? el.center?.lon ?? null,
-    });
+  const cacheKey = `personfacts:${normalizeLang(lang)}:${n.toLowerCase()}`;
+  const cached = cacheGet(cacheKey);
+  if (cached) return cached;
+
+  const results = await wikidataSearch(n, lang);
+  if (!results.length) {
+    const out = { ok: false, facts: [], person: null };
+    cacheSet(cacheKey, out, config.geoCacheTtlMs);
+    return out;
   }
 
-  return out.slice(0, 12);
-}
+  // pick first non-sensitive result
+  let picked = null;
+  for (const r of results) {
+    const d = r?.description || "";
+    if (isSensitiveDescription(d)) continue;
+    picked = r;
+    break;
+  }
+  if (!picked) {
+    const out = { ok: false, facts: [], person: null };
+    cacheSet(cacheKey, out, config.geoCacheTtlMs);
+    return out;
+  }
 
-export async function getFactsForPoiCandidate(poi) {
-  // Rate limit a bit to be polite to Wikipedia in burst mode.
-  await sleep(80);
+  const qid = picked.id;
+  const ent = await wikidataEntity(qid);
+  if (!ent) {
+    const out = { ok: false, facts: [], person: null };
+    cacheSet(cacheKey, out, config.geoCacheTtlMs);
+    return out;
+  }
 
-  const summary =
-    poi.wikipediaUrl
-      ? await fetchWikipediaSummaryByUrl(poi.wikipediaUrl)
-      : (poi.wikipediaTitle ? await fetchWikipediaSummaryByTitle(poi.wikipediaTitle) : null);
+  const personLabel = labelFor(ent, lang) || picked.label || n;
+  const personDesc = descFor(ent, lang) || picked.description || "";
 
-  if (!summary) return { ...poi, facts: [], summary: null };
+  if (isSensitiveDescription(personDesc)) {
+    const out = { ok: false, facts: [], person: null };
+    cacheSet(cacheKey, out, config.geoCacheTtlMs);
+    return out;
+  }
 
-  // Facts extraction: keep it simple and robust.
   const facts = [];
-  const extract = safeTrim(summary.extract, 1200);
 
-  if (summary.description) facts.push(summary.description);
-  if (extract) facts.push(extract);
+  const born = getClaim(ent, "P569"); // date of birth
+  const bornStr = getTimeString(born);
+  if (bornStr) facts.push(safeFactLine(`${personLabel} נולד/ה ב-${bornStr}.`));
 
-  return {
-    ...poi,
-    summary,
-    facts,
-    wikipediaUrl: poi.wikipediaUrl || summary.pageUrl || null,
-    imageUrl: poi.imageUrl || summary.thumbnail || null,
+  const occupation = getClaim(ent, "P106"); // occupation (qid)
+  if (occupation?.id) {
+    // We cannot reliably translate occupation without extra lookups, keep it subtle:
+    facts.push(safeFactLine(`${personLabel}: ${safeTrim(personDesc, 120)}.`));
+  } else if (personDesc) {
+    facts.push(safeFactLine(`${personLabel}: ${safeTrim(personDesc, 120)}.`));
+  }
+
+  // spouse (personal-life juice) if present
+  const spouse = getClaim(ent, "P26");
+  if (spouse?.id) {
+    facts.push(safeFactLine(`פרט אישי קטן: היו לו/לה חיי זוגיות מתועדים ב-Wikidata.`));
+  }
+
+  const cleanFacts = facts.filter(Boolean).slice(0, 3);
+
+  const out = {
+    ok: cleanFacts.length > 0,
+    facts: cleanFacts,
+    person: {
+      qid,
+      label: personLabel,
+      description: personDesc,
+    },
   };
+
+  cacheSet(cacheKey, out, config.geoCacheTtlMs);
+  return out;
 }
