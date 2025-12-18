@@ -1,66 +1,121 @@
 /**
  * Story generation (ESM).
- * Uses a safe, template-based generator.
- * If OPENAI_API_KEY is available and you later want to use it, you can extend here.
+ * Forces output language using OpenAI, so choosing "he"/"fr" etc actually works.
+ *
+ * Uses env:
+ *   OPENAI_API_KEY (required)
+ *   OPENAI_TEXT_MODEL (optional, default: gpt-4o-mini)
  */
-import { safeTrim } from "./utils.js";
 
-function pickOne(arr, fallback = "") {
-  if (!arr || arr.length === 0) return fallback;
-  return arr[Math.floor(Math.random() * arr.length)];
+import { config } from "./config.js";
+import { HttpError, safeTrim } from "./utils.js";
+
+function requireOpenAIKey() {
+  if (!config.openaiApiKey) throw new HttpError(500, "Missing OPENAI_API_KEY");
 }
 
-export function generateStoryText({ poi, taste }) {
-  const name = poi?.label || "this place";
-  const desc = poi?.summary?.description || poi?.description || "";
-  const extract = poi?.summary?.extract || pickOne(poi?.facts || [], "");
+function normalizeLang(lang) {
+  const v = String(lang || "en").toLowerCase();
+  if (v.startsWith("he")) return "he";
+  if (v.startsWith("fr")) return "fr";
+  if (v.startsWith("en")) return "en";
+  return v.slice(0, 5);
+}
 
-  const humor = taste?.humor ?? 0.6;     // 0..1
-  const nerdy = taste?.nerdy ?? 0.5;     // 0..1
-  const dramatic = taste?.dramatic ?? 0.35; // 0..1
-  const shortness = taste?.shortness ?? 0.4; // 0..1 (1=short)
+function targetLanguageName(lang) {
+  const l = normalizeLang(lang);
+  if (l === "he") return "Hebrew";
+  if (l === "fr") return "French";
+  if (l === "en") return "English";
+  return "the requested language";
+}
 
-  const openers = [
-    `Quick detour: you're near ${name}.`,
-    `Heads up: ${name} is close by.`,
-    `Okay, story time. You're near ${name}.`,
-  ];
+function formatFacts(poi) {
+  const facts = Array.isArray(poi?.facts) ? poi.facts : [];
+  const cleaned = facts
+    .map((f) => (typeof f === "string" ? f.trim() : ""))
+    .filter(Boolean)
+    .slice(0, 8);
 
-  const spice = [];
-  if (humor > 0.65) spice.push("Try not to pretend you already knew this.");
-  if (nerdy > 0.65) spice.push("Yes, this is your officially-approved nerd moment.");
-  if (dramatic > 0.65) spice.push("This is where reality quietly becomes a movie scene.");
+  if (!cleaned.length) return "(no strong facts)";
 
-  const cta = [
-    "If you can, look around for a small detail that proves it really exists outside your screen.",
-    "If you're passing by, give it one glance. Your future self will appreciate it.",
-    "If you're stuck in traffic, congratulations: you just earned a free fun fact.",
-  ];
+  return cleaned.map((f, i) => `${i + 1}. ${f}`).join("\n");
+}
 
-  const bodyParts = [];
+async function openaiChat({ system, user }) {
+  requireOpenAIKey();
 
-  if (desc) bodyParts.push(`${name} is best described as: ${desc}.`);
-  if (extract) bodyParts.push(safeTrim(extract, 700));
+  const model = process.env.OPENAI_TEXT_MODEL || "gpt-4o-mini";
+  const url = `${config.openaiBaseUrl}/v1/chat/completions`;
 
-  if (dramatic > 0.55) {
-    bodyParts.push(pickOne([
-      `Imagine all the years this spot has been watching people come and go.`,
-      `Places like this outlive trends, arguments, and most phone batteries.`,
-    ]));
+  const payload = {
+    model,
+    temperature: 0.7,
+    messages: [
+      { role: "system", content: system },
+      { role: "user", content: user },
+    ],
+  };
+
+  const res = await fetch(url, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${config.openaiApiKey}`,
+    },
+    body: JSON.stringify(payload),
+  });
+
+  if (!res.ok) {
+    const t = await res.text().catch(() => "");
+    throw new HttpError(
+      res.status,
+      "OpenAI story generation failed",
+      safeTrim(t, 900)
+    );
   }
 
-  if (nerdy > 0.55) {
-    bodyParts.push(pickOne([
-      `If you want to go deeper later, check its Wikipedia page and scan the timeline.`,
-      `Small challenge: later, look up one surprising date connected to it.`,
-    ]));
-  }
+  const json = await res.json();
+  const text = json?.choices?.[0]?.message?.content ?? "";
+  return String(text);
+}
 
-  const maxBody = shortness > 0.7 ? 2 : (shortness > 0.4 ? 3 : 4);
-  const body = bodyParts.filter(Boolean).slice(0, maxBody).join(" ");
+export async function generateStoryText({ poi, taste, lang = "en" }) {
+  const l = normalizeLang(lang);
+  const languageName = targetLanguageName(l);
 
-  const outro = pickOne(cta);
-  const extra = spice.length ? " " + pickOne(spice) : "";
+  const poiName = poi?.label || "a place";
+  const poiDesc = poi?.description || "";
+  const wiki = poi?.wikipediaUrl || "";
 
-  return `${pickOne(openers)} ${body} ${outro}${extra}`.replace(/\s+/g, " ").trim();
+  const factsBlock = formatFacts(poi);
+
+  const humor = taste?.humor ?? 0.6;
+
+  const system = [
+    `You write short, engaging micro-stories for a travel app named BYTHEWAY.`,
+    `Safety: keep it clean and teen-safe. No sexual content, no explicit violence, no hate.`,
+    `Output language must be ${languageName}. Do not mix languages.`,
+    `Length: 70-140 words.`,
+    `Style: friendly, witty, a bit punchy. Keep facts accurate and don't invent new facts.`,
+    `If facts are weak, say so lightly and keep it general.`,
+  ].join(" ");
+
+  const user = [
+    `Place name: ${poiName}`,
+    poiDesc ? `Description: ${poiDesc}` : "",
+    wiki ? `Wikipedia: ${wiki}` : "",
+    `Facts:`,
+    factsBlock,
+    `Humor level (0-1): ${Number(humor)}`,
+    `Write the story now.`,
+  ]
+    .filter(Boolean)
+    .join("\n");
+
+  const out = await openaiChat({ system, user });
+  const trimmed = safeTrim(out, 1400);
+
+  if (!trimmed) throw new HttpError(500, "Empty story text from OpenAI");
+  return trimmed;
 }

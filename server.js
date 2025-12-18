@@ -55,6 +55,16 @@ app.post("/api/story-both", async (req, res) => {
   try {
     const lat = assertFiniteNumber(req.body?.lat, "lat");
     const lng = assertFiniteNumber(req.body?.lng, "lng");
+
+    // The app should send a 2-letter language code (e.g. "he", "en", "fr").
+    // We accept a few common keys to be resilient.
+    const langRaw =
+      (req.body?.lang ??
+        req.body?.language ??
+        req.body?.locale ??
+        req.body?.speechLang) || "en";
+    const lang = String(langRaw).toLowerCase().slice(0, 5); // allow "pt-br" etc.
+
     const userId = req.body?.userId ? String(req.body.userId) : null;
     const tasteProfileId = req.body?.tasteProfileId
       ? String(req.body.tasteProfileId)
@@ -88,6 +98,7 @@ app.post("/api/story-both", async (req, res) => {
         reason: poiPick.reason,
         distanceMetersApprox: poiPick.distanceMetersApprox ?? null,
         poi: poiPick.poi ?? null,
+        lang,
 
         // Backward compatibility for the app:
         text: "",
@@ -101,9 +112,11 @@ app.post("/api/story-both", async (req, res) => {
     }
 
     const poi = poiPick.poiWithFacts;
-    const storyText = generateStoryText({ poi, taste });
 
-    const audioBuf = await synthesizeTts(storyText);
+    // IMPORTANT: story generation is async now because we force the language via OpenAI.
+    const storyText = await generateStoryText({ poi, taste, lang });
+
+    const audioBuf = await synthesizeTts(storyText, { lang });
     const audioBase64 = audioToBase64(audioBuf);
     const audioContentType = getTtsContentType();
 
@@ -128,6 +141,7 @@ app.post("/api/story-both", async (req, res) => {
       shouldSpeak: true,
       reason: "ok",
       distanceMetersApprox: poi.distanceMetersApprox ?? null,
+      lang,
       poi: {
         key: poi.key,
         source: poi.source,
