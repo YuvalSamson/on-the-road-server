@@ -1,10 +1,17 @@
 /**
- * Story generation (ESM).
- * Forces output language using OpenAI, so choosing "he"/"fr" etc actually works.
+ * storyService.js (ESM)
+ * Generates the spoken micro-story text.
  *
- * Uses env:
- *   OPENAI_API_KEY (required)
- *   OPENAI_TEXT_MODEL (optional, default: gpt-4o-mini)
+ * Goals:
+ * - Respect requested language (he/en/fr)
+ * - Avoid hot-button topics (e.g., 1948, conflict/politics/ethnic/religious tension)
+ * - Add "BTW vibe": short, punchy, lightly witty (not forced), one sensory detail
+ * - Add a personal-life detail about a notable person ONLY if it exists in the provided facts
+ * - No hallucinations: do not invent facts
+ *
+ * Env:
+ * - OPENAI_API_KEY (required)
+ * - OPENAI_TEXT_MODEL (optional, default: gpt-4o-mini)
  */
 
 import { config } from "./config.js";
@@ -30,16 +37,72 @@ function targetLanguageName(lang) {
   return "the requested language";
 }
 
-function formatFacts(poi) {
+function isSensitiveFactLine(line) {
+  const s = String(line || "").toLowerCase();
+
+  // Keep this intentionally strict: if it smells like conflict/politics/violence, drop it.
+  const patterns = [
+    /1948/,
+    /\bnakba\b/,
+    /\bwar\b/,
+    /\bmassacre\b/,
+    /\bterror\b/,
+    /\boccupation\b/,
+    /\bexpell(ed|ing)?\b/,
+    /\bkilled\b/,
+    /מלחמ/,
+    /נכבה/,
+    /טבח/,
+    /רצח/,
+    /נהרג/,
+    /טרור/,
+    /כיבוש/,
+    /גורש/,
+    /פלסטינ/,
+  ];
+
+  return patterns.some((re) => re.test(s));
+}
+
+function takeFacts(poi, max = 8) {
   const facts = Array.isArray(poi?.facts) ? poi.facts : [];
-  const cleaned = facts
+  return facts
     .map((f) => (typeof f === "string" ? f.trim() : ""))
     .filter(Boolean)
-    .slice(0, 8);
+    .filter((f) => !isSensitiveFactLine(f))
+    .slice(0, max);
+}
 
-  if (!cleaned.length) return "(no strong facts)";
+function pickPersonalLifeFacts(facts) {
+  // We only allow personal-life flavor if it's explicitly in facts.
+  // Heuristics: look for "born", "married", "wife", "husband", "children", "grew up", Hebrew equivalents.
+  const patterns = [
+    /\bborn\b/i,
+    /\bmarried\b/i,
+    /\bwife\b/i,
+    /\bhusband\b/i,
+    /\bchildren\b/i,
+    /\bgrew up\b/i,
+    /\bfamily\b/i,
+    /נולד/,
+    /נולדה/,
+    /התחתנ/,
+    /אשתו/,
+    /בעלה/,
+    /ילדיו/,
+    /ילדיה/,
+    /משפחת/,
+    /גדל/,
+    /גדלה/,
+  ];
 
-  return cleaned.map((f, i) => `${i + 1}. ${f}`).join("\n");
+  const hits = facts.filter((f) => patterns.some((re) => re.test(f)));
+  return hits.slice(0, 2);
+}
+
+function formatFactsBlock(facts) {
+  if (!facts.length) return "(no strong facts)";
+  return facts.map((f, i) => `${i + 1}. ${f}`).join("\n");
 }
 
 async function openaiChat({ system, user }) {
@@ -68,11 +131,7 @@ async function openaiChat({ system, user }) {
 
   if (!res.ok) {
     const t = await res.text().catch(() => "");
-    throw new HttpError(
-      res.status,
-      "OpenAI story generation failed",
-      safeTrim(t, 900)
-    );
+    throw new HttpError(res.status, "OpenAI story generation failed", safeTrim(t, 900));
   }
 
   const json = await res.json();
@@ -80,6 +139,9 @@ async function openaiChat({ system, user }) {
   return String(text);
 }
 
+/**
+ * Public API used by server.js
+ */
 export async function generateStoryText({ poi, taste, lang = "en" }) {
   const l = normalizeLang(lang);
   const languageName = targetLanguageName(l);
@@ -88,26 +150,40 @@ export async function generateStoryText({ poi, taste, lang = "en" }) {
   const poiDesc = poi?.description || "";
   const wiki = poi?.wikipediaUrl || "";
 
-  const factsBlock = formatFacts(poi);
+  const facts = takeFacts(poi, 8);
+  const personalHints = pickPersonalLifeFacts(facts);
 
-  const humor = taste?.humor ?? 0.6;
+  // Taste is optional. Keep it safe and lightweight.
+  const humor = Number(taste?.humor ?? 0.6);
 
   const system = [
-    `You write short, engaging micro-stories for a travel app named BYTHEWAY.`,
-    `Safety: keep it clean and teen-safe. No sexual content, no explicit violence, no hate.`,
+    `You write short micro-stories for a travel app named BYTHEWAY.`,
     `Output language must be ${languageName}. Do not mix languages.`,
-    `Length: 70-140 words.`,
-    `Style: friendly, witty, a bit punchy. Keep facts accurate and don't invent new facts.`,
-    `If facts are weak, say so lightly and keep it general.`,
+    `Safety and tone rules:`,
+    `- Keep it clean and teen-safe: no sexual content, no explicit violence, no hate.`,
+    `- Avoid hot-button topics: no politics, no conflict/war, no ethnic/religious tension, no historical controversy.`,
+    `- If the provided facts contain such topics, ignore them. Do not mention years like 1948.`,
+    `Style rules (BYTHEWAY):`,
+    `- 70-130 words.`,
+    `- Hook in the first sentence (question or surprising angle).`,
+    `- Include exactly 1 gentle, understated smile-worthy line (not a forced metaphor).`,
+    `- Include 1 sensory detail (sound/smell/texture/heat/wind).`,
+    `- No generic closings like "every place has a story". No lecturing.`,
+    `- Facts must be grounded ONLY in the provided facts. Do not invent.`,
+    `Personal "juice" rule:`,
+    `- If there is a notable person personal-life detail in the provided facts, include ONE such detail.`,
+    `- If not present, do NOT invent; skip it.`,
+    `Formatting: plain text, no bullets, no emojis.`,
   ].join(" ");
 
   const user = [
     `Place name: ${poiName}`,
     poiDesc ? `Description: ${poiDesc}` : "",
     wiki ? `Wikipedia: ${wiki}` : "",
-    `Facts:`,
-    factsBlock,
-    `Humor level (0-1): ${Number(humor)}`,
+    `Facts (sanitized):`,
+    formatFactsBlock(facts),
+    personalHints.length ? `Personal-life fact hints (use at most one):\n${formatFactsBlock(personalHints)}` : `Personal-life fact hints: (none provided)`,
+    `Humor level (0-1): ${Number.isFinite(humor) ? humor : 0.6}`,
     `Write the story now.`,
   ]
     .filter(Boolean)
