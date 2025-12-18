@@ -1,69 +1,78 @@
 /**
- * Taste profile service (ESM).
- * Minimal, safe, and easy to evolve.
+ * tasteService.js (ESM)
+ *
+ * Minimal, crash-proof taste handling.
+ * No safety/disallowSexualContent fields at all.
+ * Uses in-memory store to avoid DB coupling.
  */
-import { sha1, clamp } from "./utils.js";
-import { getTasteProfile, upsertTasteProfile } from "./db.js";
 
-export function defaultTaste() {
+import crypto from "crypto";
+
+const byId = new Map();     // tasteProfileId -> taste
+const byUser = new Map();   // userId -> tasteProfileId
+
+function clamp01(v, fallback = 0.55) {
+  const n = typeof v === "number" ? v : Number(v);
+  if (!Number.isFinite(n)) return fallback;
+  return Math.max(0, Math.min(1, n));
+}
+
+export function normalizeTasteInput(raw) {
+  const t = raw && typeof raw === "object" ? raw : {};
   return {
-    humor: 0.6,
-    nerdy: 0.5,
-    dramatic: 0.35,
-    shortness: 0.45,
-    // Add more later: "historyVsPop", "sarcasm", etc.
+    humor: clamp01(t.humor, 0.55),
+    nerdy: clamp01(t.nerdy, 0.35),
+    dramatic: clamp01(t.dramatic, 0.25),
+    shorter: clamp01(t.shorter, 0.2),
   };
 }
 
-export function normalizeTasteInput(obj = {}) {
-  const d = defaultTaste();
-  const out = { ...d };
-
-  for (const k of Object.keys(d)) {
-    if (obj[k] === undefined) continue;
-    const n = Number(obj[k]);
-    if (Number.isFinite(n)) out[k] = clamp(n, 0, 1);
+export async function getOrCreateTasteProfile({ userId, tasteProfileId }) {
+  // 1) explicit id
+  if (tasteProfileId && byId.has(String(tasteProfileId))) {
+    const id = String(tasteProfileId);
+    return { id, taste: byId.get(id) || normalizeTasteInput({}) };
   }
-  return out;
-}
 
-export async function getOrCreateTasteProfile({ userId = null, tasteProfileId = null }) {
-  const id = tasteProfileId || (userId ? `taste:${sha1(userId)}` : `taste:anon`);
-  const existing = await getTasteProfile(id);
-  if (existing) return { id, taste: normalizeTasteInput(existing) };
+  // 2) user binding
+  if (userId && byUser.has(String(userId))) {
+    const id = byUser.get(String(userId));
+    if (id && byId.has(id)) return { id, taste: byId.get(id) };
+  }
 
-  const taste = defaultTaste();
-  await upsertTasteProfile(id, taste);
+  // 3) create new
+  const id = crypto.randomUUID();
+  const taste = normalizeTasteInput({});
+  byId.set(id, taste);
+  if (userId) byUser.set(String(userId), id);
   return { id, taste };
 }
 
 export function applyFeedback(taste, feedback) {
-  // feedback: { liked: boolean, moreHumor?: boolean, moreNerdy?: boolean, shorter?: boolean }
-  const t = normalizeTasteInput(taste);
+  const t = normalizeTasteInput(taste || {});
+  const f = feedback && typeof feedback === "object" ? feedback : {};
 
-  const bump = (k, dir, amount = 0.06) => {
-    t[k] = clamp(t[k] + dir * amount, 0, 1);
-  };
+  let humor = t.humor;
+  let nerdy = t.nerdy;
+  let dramatic = t.dramatic;
+  let shorter = t.shorter;
 
-  if (feedback?.moreHumor === true) bump("humor", +1);
-  if (feedback?.moreHumor === false) bump("humor", -1);
+  if (f.moreHumor != null) humor = clamp01(Number(f.moreHumor), humor);
+  if (f.moreNerdy != null) nerdy = clamp01(Number(f.moreNerdy), nerdy);
+  if (f.moreDramatic != null) dramatic = clamp01(Number(f.moreDramatic), dramatic);
+  if (f.shorter != null) shorter = clamp01(Number(f.shorter), shorter);
 
-  if (feedback?.moreNerdy === true) bump("nerdy", +1);
-  if (feedback?.moreNerdy === false) bump("nerdy", -1);
+  if (f.liked === true) {
+    humor = clamp01(humor + 0.03, humor);
+  } else if (f.liked === false) {
+    shorter = clamp01(shorter + 0.05, shorter);
+  }
 
-  if (feedback?.shorter === true) bump("shortness", +1);
-  if (feedback?.shorter === false) bump("shortness", -1);
-
-  if (feedback?.moreDramatic === true) bump("dramatic", +1);
-  if (feedback?.moreDramatic === false) bump("dramatic", -1);
-
-  // If user simply liked/disliked, small reinforcement
-  if (feedback?.liked === true) bump("humor", +1, 0.02);
-  if (feedback?.liked === false) bump("shortness", +1, 0.02);
-
-  return t;
+  return { humor, nerdy, dramatic, shorter };
 }
 
-export async function saveTasteProfile(id, taste) {
-  await upsertTasteProfile(id, normalizeTasteInput(taste));
+export async function saveTasteProfile(tasteProfileId, taste) {
+  const id = String(tasteProfileId || "");
+  if (!id) return;
+  byId.set(id, normalizeTasteInput(taste || {}));
 }

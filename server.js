@@ -1,5 +1,6 @@
 /**
  * BYTHEWAY server entry (ESM)
+ * Root-level file version: imports siblings from project root.
  */
 
 import express from "express";
@@ -48,23 +49,6 @@ app.get("/health", (req, res) => {
   res.status(200).send(config.version);
 });
 
-function normalizeTasteForSafety(taste) {
-  const t = taste && typeof taste === "object" ? taste : {};
-  const safety = t.safety && typeof t.safety === "object" ? t.safety : {};
-
-  const disallowSexualContent =
-    safety.disallowSexualContent ?? t.disallowSexualContent ?? true;
-
-  return {
-    ...t,
-    safety: {
-      ...safety,
-      disallowSexualContent,
-    },
-    disallowSexualContent,
-  };
-}
-
 app.post("/api/story-both", async (req, res) => {
   const startedAt = Date.now();
 
@@ -99,9 +83,6 @@ app.post("/api/story-both", async (req, res) => {
       tasteProfileId,
     });
 
-    // CRITICAL: ensure taste.safety exists so no module can crash on it
-    const safeTaste = normalizeTasteForSafety(taste);
-
     const poiPick = await findBestPoi({ lat, lng, userId, lang });
 
     if (!poiPick.shouldSpeak) {
@@ -126,7 +107,6 @@ app.post("/api/story-both", async (req, res) => {
         distanceMetersApprox: poiPick.distanceMetersApprox ?? null,
         poi: poiPick.poi ?? null,
         lang,
-
         text: "",
         storyText: "",
         audioBase64: "",
@@ -139,7 +119,7 @@ app.post("/api/story-both", async (req, res) => {
 
     const storyText = await generateStoryText({
       poi,
-      taste: safeTaste,
+      taste: taste || {},
       lang,
     });
 
@@ -235,7 +215,7 @@ app.post("/api/taste/feedback", async (req, res) => {
       moreDramatic: req.body?.moreDramatic,
     };
 
-    const updated = applyFeedback(taste, feedback);
+    const updated = applyFeedback(taste || {}, feedback);
     await saveTasteProfile(tpId, updated);
 
     return res
