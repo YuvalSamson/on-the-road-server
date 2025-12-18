@@ -1,6 +1,8 @@
 /**
- * BYTHEWAY server entry (ESM).
+ * BYTHEWAY server entry (ESM)
+ * Root-level file version: imports siblings from project root.
  */
+
 import express from "express";
 import cors from "cors";
 
@@ -10,21 +12,35 @@ import { makeLogger, assertFiniteNumber } from "./utils.js";
 import { findBestPoi } from "./poiService.js";
 import { generateStoryText } from "./storyService.js";
 import { synthesizeTts, audioToBase64, getTtsContentType } from "./tts.js";
-import { getOrCreateTasteProfile, applyFeedback, saveTasteProfile, normalizeTasteInput } from "./tasteService.js";
+import {
+  getOrCreateTasteProfile,
+  applyFeedback,
+  saveTasteProfile,
+  normalizeTasteInput,
+} from "./tasteService.js";
 
 const log = makeLogger("BYTHEWAY");
 const app = express();
 
 app.use(express.json({ limit: "1mb" }));
 
+// CORS
 if (config.corsAllowOrigins && config.corsAllowOrigins !== "*") {
-  const allowed = new Set(config.corsAllowOrigins.split(",").map((s) => s.trim()).filter(Boolean));
-  app.use(cors({
-    origin: (origin, cb) => {
-      if (!origin) return cb(null, true);
-      return cb(null, allowed.has(origin));
-    },
-  }));
+  const allowed = new Set(
+    config.corsAllowOrigins
+      .split(",")
+      .map((s) => s.trim())
+      .filter(Boolean)
+  );
+
+  app.use(
+    cors({
+      origin: (origin, cb) => {
+        if (!origin) return cb(null, true);
+        return cb(null, allowed.has(origin));
+      },
+    })
+  );
 } else {
   app.use(cors({ origin: true }));
 }
@@ -40,9 +56,14 @@ app.post("/api/story-both", async (req, res) => {
     const lat = assertFiniteNumber(req.body?.lat, "lat");
     const lng = assertFiniteNumber(req.body?.lng, "lng");
     const userId = req.body?.userId ? String(req.body.userId) : null;
-    const tasteProfileId = req.body?.tasteProfileId ? String(req.body.tasteProfileId) : null;
+    const tasteProfileId = req.body?.tasteProfileId
+      ? String(req.body.tasteProfileId)
+      : null;
 
-    const { id: tpId, taste } = await getOrCreateTasteProfile({ userId, tasteProfileId });
+    const { id: tpId, taste } = await getOrCreateTasteProfile({
+      userId,
+      tasteProfileId,
+    });
 
     const poiPick = await findBestPoi({ lat, lng, userId });
 
@@ -65,8 +86,11 @@ app.post("/api/story-both", async (req, res) => {
         version: config.version,
         shouldSpeak: false,
         reason: poiPick.reason,
-        distanceMetersApprox: poiPick.distanceMetersApprox,
-        poi: poiPick.poi,
+        distanceMetersApprox: poiPick.distanceMetersApprox ?? null,
+        poi: poiPick.poi ?? null,
+        text: "",
+        storyText: "",
+        audio: null,
       });
     }
 
@@ -92,7 +116,7 @@ app.post("/api/story-both", async (req, res) => {
 
     const ms = Date.now() - startedAt;
 
-    res.status(200).json({
+    return res.status(200).json({
       version: config.version,
       shouldSpeak: true,
       reason: "ok",
@@ -106,7 +130,11 @@ app.post("/api/story-both", async (req, res) => {
         imageUrl: poi.imageUrl ?? null,
       },
       facts: (poi.facts || []).slice(0, 6),
+
+      // IMPORTANT: keep both keys for backward compatibility with the app
+      text: storyText,
       storyText,
+
       audio: {
         contentType: getTtsContentType(),
         base64: audioBase64,
@@ -115,9 +143,15 @@ app.post("/api/story-both", async (req, res) => {
       timingMs: ms,
     });
   } catch (err) {
-    log.error("story-both error:", err?.status, err?.message, err?.details || "");
-    const status = err?.status && Number.isFinite(err.status) ? err.status : 500;
-    res.status(status).json({
+    log.error(
+      "story-both error:",
+      err?.status,
+      err?.message,
+      err?.details || ""
+    );
+    const status =
+      err?.status && Number.isFinite(err.status) ? err.status : 500;
+    return res.status(status).json({
       version: config.version,
       error: err?.message || "Server error",
       details: err?.details || null,
@@ -128,9 +162,14 @@ app.post("/api/story-both", async (req, res) => {
 app.post("/api/taste/feedback", async (req, res) => {
   try {
     const userId = req.body?.userId ? String(req.body.userId) : null;
-    const tasteProfileId = req.body?.tasteProfileId ? String(req.body.tasteProfileId) : null;
+    const tasteProfileId = req.body?.tasteProfileId
+      ? String(req.body.tasteProfileId)
+      : null;
 
-    const { id: tpId, taste } = await getOrCreateTasteProfile({ userId, tasteProfileId });
+    const { id: tpId, taste } = await getOrCreateTasteProfile({
+      userId,
+      tasteProfileId,
+    });
 
     const feedback = {
       liked: req.body?.liked === true,
@@ -143,28 +182,37 @@ app.post("/api/taste/feedback", async (req, res) => {
     const updated = applyFeedback(taste, feedback);
     await saveTasteProfile(tpId, updated);
 
-    res.status(200).json({ ok: true, tasteProfileId: tpId, taste: updated });
+    return res.status(200).json({ ok: true, tasteProfileId: tpId, taste: updated });
   } catch (err) {
-    res.status(500).json({ ok: false, error: err?.message || "Server error" });
+    return res.status(500).json({ ok: false, error: err?.message || "Server error" });
   }
 });
 
 app.post("/api/taste/set", async (req, res) => {
   try {
-    const tasteProfileId = req.body?.tasteProfileId ? String(req.body.tasteProfileId) : null;
-    if (!tasteProfileId) return res.status(400).json({ ok: false, error: "tasteProfileId is required" });
+    const tasteProfileId = req.body?.tasteProfileId
+      ? String(req.body.tasteProfileId)
+      : null;
+
+    if (!tasteProfileId) {
+      return res
+        .status(400)
+        .json({ ok: false, error: "tasteProfileId is required" });
+    }
 
     const taste = normalizeTasteInput(req.body?.taste || {});
     await saveTasteProfile(tasteProfileId, taste);
 
-    res.status(200).json({ ok: true, tasteProfileId, taste });
+    return res.status(200).json({ ok: true, tasteProfileId, taste });
   } catch (err) {
-    res.status(500).json({ ok: false, error: err?.message || "Server error" });
+    return res.status(500).json({ ok: false, error: err?.message || "Server error" });
   }
 });
 
 async function main() {
-  await initDb().catch((e) => log.warn("DB init skipped/failed:", e?.message || e));
+  await initDb().catch((e) =>
+    log.warn("DB init skipped/failed:", e?.message || e)
+  );
 
   app.listen(config.port, () => {
     log.info(`Listening on port ${config.port}`);
