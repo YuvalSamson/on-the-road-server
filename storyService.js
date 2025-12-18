@@ -215,11 +215,12 @@ export async function generateStoryText({ poi, taste, lang = "en" }) {
   // Robust taste defaults (this fixes your crash indirectly)
   const t = taste || {};
   const safety = t.safety || {};
-  const disallowSexualContent =
-    safety.disallowSexualContent ?? t.disallowSexualContent ?? true;
+const disallowSexualContent =
+  (t?.safety?.disallowSexualContent ?? t?.disallowSexualContent ?? true);
 
-  // We don’t actually need the flag for now, but we keep it to avoid future crashes
-  void disallowSexualContent;
+// keep for future use, but never crash
+void disallowSexualContent;
+
 
   const poiName = poi?.label || "";
   const anchorLabel = poi?.anchor?.areaLabel || "";
