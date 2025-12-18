@@ -1,6 +1,5 @@
 /**
  * BYTHEWAY server entry (ESM)
- * Root-level file version: imports siblings from project root.
  */
 
 import express from "express";
@@ -49,19 +48,45 @@ app.get("/health", (req, res) => {
   res.status(200).send(config.version);
 });
 
+function normalizeTasteForSafety(taste) {
+  const t = taste && typeof taste === "object" ? taste : {};
+  const safety = t.safety && typeof t.safety === "object" ? t.safety : {};
+
+  const disallowSexualContent =
+    safety.disallowSexualContent ?? t.disallowSexualContent ?? true;
+
+  return {
+    ...t,
+    safety: {
+      ...safety,
+      disallowSexualContent,
+    },
+    disallowSexualContent,
+  };
+}
+
 app.post("/api/story-both", async (req, res) => {
   const startedAt = Date.now();
 
   try {
-    const lat = assertFiniteNumber(req.body?.lat, "lat");
-    const lng = assertFiniteNumber(req.body?.lng, "lng");
+    // Accept multiple key names and comma-decimal strings
+    const latRaw = req.body?.lat ?? req.body?.latitude ?? req.body?.Latitude;
+    const lngRaw =
+      req.body?.lng ??
+      req.body?.lon ??
+      req.body?.longitude ??
+      req.body?.Longitude;
+
+    const lat = assertFiniteNumber(latRaw, "lat");
+    const lng = assertFiniteNumber(lngRaw, "lng");
 
     // App sends language code like "he" / "en" / "fr"
     const langRaw =
-      (req.body?.lang ??
-        req.body?.language ??
-        req.body?.locale ??
-        req.body?.speechLang) || "en";
+      req.body?.lang ??
+      req.body?.language ??
+      req.body?.locale ??
+      req.body?.speechLang ??
+      "en";
     const lang = String(langRaw).toLowerCase().slice(0, 5);
 
     const userId = req.body?.userId ? String(req.body.userId) : null;
@@ -74,10 +99,11 @@ app.post("/api/story-both", async (req, res) => {
       tasteProfileId,
     });
 
-    // IMPORTANT: pass lang so reverse-geocode/anchor is in the right language
+    // CRITICAL: ensure taste.safety exists so no module can crash on it
+    const safeTaste = normalizeTasteForSafety(taste);
+
     const poiPick = await findBestPoi({ lat, lng, userId, lang });
 
-    // We keep the same response shape but now poiPick should almost always be shouldSpeak=true
     if (!poiPick.shouldSpeak) {
       await logStory({
         userId,
@@ -110,7 +136,12 @@ app.post("/api/story-both", async (req, res) => {
     }
 
     const poi = poiPick.poiWithFacts;
-    const storyText = await generateStoryText({ poi, taste, lang });
+
+    const storyText = await generateStoryText({
+      poi,
+      taste: safeTaste,
+      lang,
+    });
 
     const audioBuf = await synthesizeTts(storyText, { lang });
     const audioBase64 = audioToBase64(audioBuf);
@@ -138,6 +169,7 @@ app.post("/api/story-both", async (req, res) => {
       reason: poiPick.reason || "ok",
       distanceMetersApprox: poi.distanceMetersApprox ?? null,
       lang,
+
       poi: {
         key: poi.key,
         source: poi.source,
@@ -147,14 +179,15 @@ app.post("/api/story-both", async (req, res) => {
         imageUrl: poi.imageUrl ?? null,
         anchor: poi.anchor ?? null,
       },
+
       facts: (poi.facts || []).slice(0, 8),
 
-      // Backward compatibility for the app
+      // Backward compatibility
       text: storyText,
       storyText,
+
       audioBase64,
       audioContentType,
-
       audio: {
         contentType: audioContentType,
         base64: audioBase64,
