@@ -1,8 +1,6 @@
 /**
- * Central config for BTW server (ESM).
- * Reads from environment variables.
+ * Central config for BYTHEWAY server (ESM).
  */
-
 const env = (k, fallback = undefined) => {
   const v = process.env[k];
   return (v === undefined || v === "") ? fallback : v;
@@ -14,45 +12,33 @@ const toInt = (v, fallback) => {
 };
 
 export const config = {
-  version: env("BTW_VERSION", "btw-facts-only-round50-better-tts-v1"),
+  version: env("BTW_VERSION", "bytheway-facts-only-round50-openai-tts-v1"),
   nodeEnv: env("NODE_ENV", "development"),
   port: toInt(env("PORT", "3000"), 3000),
 
-  // API keys
+  // OpenAI
   openaiApiKey: env("OPENAI_API_KEY", ""),
-  elevenLabsApiKey: env("ELEVENLABS_API_KEY", ""),
-  elevenLabsVoiceId: env("ELEVENLABS_VOICE_ID", ""),
-  elevenLabsModelId: env("ELEVENLABS_MODEL_ID", "eleven_turbo_v2_5"),
+  openaiBaseUrl: env("OPENAI_BASE_URL", "https://api.openai.com"),
+  openaiTtsModel: env("OPENAI_TTS_MODEL", "gpt-4o-mini-tts"),
+  openaiTtsVoice: env("OPENAI_TTS_VOICE", "coral"),
+  openaiTtsResponseFormat: env("OPENAI_TTS_FORMAT", "mp3"),
+  openaiTtsSpeed: Number(env("OPENAI_TTS_SPEED", "1.0")),
+  openaiTtsInstructions: env(
+    "OPENAI_TTS_INSTRUCTIONS",
+    "Sound like a witty, friendly tour guide. Keep it clean and not sexual. Avoid graphic violence."
+  ),
 
-  // Optional Google Places key (not required for the Wikidata-first pipeline)
   googlePlacesApiKey: env("GOOGLE_PLACES_API_KEY", ""),
-
-  // Postgres
   databaseUrl: env("DATABASE_URL", ""),
-
-  // CORS (comma separated origins). Use "*" only if you truly need it.
   corsAllowOrigins: env("CORS_ALLOW_ORIGINS", ""),
 
-  // POI / facts
   wikidataRadiusMeters: toInt(env("WIKIDATA_RADIUS_METERS", "800"), 800),
   wikidataLimit: toInt(env("WIKIDATA_LIMIT", "15"), 15),
   overpassRadiusMeters: toInt(env("OVERPASS_RADIUS_METERS", "1000"), 1000),
   minPoiScoreToSpeak: Number(env("MIN_POI_SCORE_TO_SPEAK", "0.55")),
 
-  // Safety: keep content teen-safe
   safety: {
     disallowSexualContent: true,
     disallowGraphicViolence: true,
-  },
-
-  // TTS defaults
-  tts: {
-    outputFormat: env("ELEVENLABS_OUTPUT_FORMAT", "mp3_44100_128"),
-    voiceSettings: {
-      stability: Number(env("ELEVENLABS_STABILITY", "0.4")),
-      similarity_boost: Number(env("ELEVENLABS_SIMILARITY_BOOST", "0.8")),
-      style: Number(env("ELEVENLABS_STYLE", "0.35")),
-      use_speaker_boost: env("ELEVENLABS_SPEAKER_BOOST", "true") === "true",
-    },
   },
 };

@@ -1,5 +1,5 @@
 /**
- * BTW server entry (ESM).
+ * BYTHEWAY server entry (ESM).
  */
 import express from "express";
 import cors from "cors";
@@ -9,15 +9,14 @@ import { initDb, logStory } from "./db.js";
 import { makeLogger, assertFiniteNumber } from "./utils.js";
 import { findBestPoi } from "./poiService.js";
 import { generateStoryText } from "./storyService.js";
-import { synthesizeTts, audioToBase64 } from "./tts.js";
+import { synthesizeTts, audioToBase64, getTtsContentType } from "./tts.js";
 import { getOrCreateTasteProfile, applyFeedback, saveTasteProfile, normalizeTasteInput } from "./tasteService.js";
 
-const log = makeLogger("BTW");
+const log = makeLogger("BYTHEWAY");
 const app = express();
 
 app.use(express.json({ limit: "1mb" }));
 
-// CORS
 if (config.corsAllowOrigins && config.corsAllowOrigins !== "*") {
   const allowed = new Set(config.corsAllowOrigins.split(",").map((s) => s.trim()).filter(Boolean));
   app.use(cors({
@@ -109,7 +108,7 @@ app.post("/api/story-both", async (req, res) => {
       facts: (poi.facts || []).slice(0, 6),
       storyText,
       audio: {
-        contentType: "audio/mpeg",
+        contentType: getTtsContentType(),
         base64: audioBase64,
         bytes: audioBuf.length,
       },

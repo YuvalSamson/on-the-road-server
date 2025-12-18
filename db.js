@@ -2,12 +2,9 @@
  * Postgres helpers (ESM).
  * If DATABASE_URL is empty, we run in "no-db" mode (in-memory only).
  *
- * Render Postgres typically requires SSL/TLS. If you see:
- *   "SSL/TLS required"
- * then you must enable SSL on the pg Pool.
- *
+ * Render Postgres often requires SSL/TLS.
  * Control:
- *   DB_SSL=true|false   (default: true)
+ *   DB_SSL=false   to disable SSL (default is SSL enabled)
  */
 import pg from "pg";
 import { config } from "./config.js";
@@ -24,7 +21,7 @@ export function hasDb() {
 function shouldUseSsl() {
   const raw = process.env.DB_SSL;
   if (raw === "false" || raw === "0") return false;
-  return true; // default true (good for Render)
+  return true;
 }
 
 export function getPool() {
@@ -32,7 +29,6 @@ export function getPool() {
 
   if (!pool) {
     const useSsl = shouldUseSsl();
-
     pool = new Pool({
       connectionString: config.databaseUrl,
       max: 10,
