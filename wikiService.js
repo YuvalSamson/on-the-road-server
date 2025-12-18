@@ -1,15 +1,14 @@
 /**
  * wikiService.js (ESM)
  *
- * Minimal Wikidata-based helper to extract safe, non-controversial facts
- * for a person name (for street-name anchoring).
- *
- * We explicitly filter out political/war/conflict sensitive stuff.
+ * IMPORTANT:
+ * - No SPARQL.
+ * - Never throws on Wikidata errors. If Wikidata fails, returns ok:false and empty facts.
+ * - Produces small, neutral person facts ONLY when clearly available.
  */
 
 import { config } from "./config.js";
 import {
-  HttpError,
   cacheGet,
   cacheSet,
   fetchJson,
@@ -38,34 +37,26 @@ function isSensitiveDescription(desc) {
     "war",
     "military",
     "conflict",
-    "כיבוש",
+    "occupation",
     "פוליטיקאי",
     "פוליטיקה",
-    "שר ",
+    "שר",
     "נשיא",
     "ראש ממשלה",
     "מלחמה",
     "צבא",
     "טרור",
+    "כיבוש",
   ];
   return bad.some((w) => s.includes(w));
 }
 
 function safeFactLine(s) {
-  const t = normalizeWhitespace(s);
+  const t = String(s || "").trim();
   if (!t) return "";
-  // avoid 1948 and similar hot-button years
   if (/\b1948\b/.test(t)) return "";
   if (/נכבה|מלחמ|כיבוש|טרור|טבח|רצח|נהרג/.test(t)) return "";
   return t;
-}
-
-function pickFirstString(arr) {
-  if (!Array.isArray(arr)) return "";
-  for (const x of arr) {
-    if (typeof x === "string" && x.trim()) return x.trim();
-  }
-  return "";
 }
 
 function getClaim(entity, pid) {
@@ -75,34 +66,11 @@ function getClaim(entity, pid) {
 }
 
 function getTimeString(timeObj) {
-  // Wikidata time format: { time: "+1879-03-14T00:00:00Z", ... }
   const t = timeObj?.time;
   if (!t) return "";
   const m = String(t).match(/([0-9]{4})-([0-9]{2})-([0-9]{2})/);
   if (!m) return "";
   return `${m[1]}-${m[2]}-${m[3]}`;
-}
-
-async function wikidataSearch(name, lang) {
-  const l = normalizeLang(lang);
-  const url =
-    "https://www.wikidata.org/w/api.php" +
-    `?action=wbsearchentities&search=${encodeURIComponent(name)}` +
-    `&language=${encodeURIComponent(l)}` +
-    `&format=json&limit=5&origin=*`;
-
-  const r = await fetchJson(url, { timeoutMs: config.httpTimeoutMs });
-  if (!r.ok || !r.json) return [];
-  return Array.isArray(r.json.search) ? r.json.search : [];
-}
-
-async function wikidataEntity(qid) {
-  const url = `https://www.wikidata.org/wiki/Special:EntityData/${encodeURIComponent(qid)}.json`;
-  const r = await fetchJson(url, { timeoutMs: config.httpTimeoutMs });
-  if (!r.ok || !r.json) return null;
-
-  const ent = r.json?.entities?.[qid];
-  return ent || null;
 }
 
 function labelFor(entity, lang) {
@@ -127,84 +95,124 @@ function descFor(entity, lang) {
   );
 }
 
-export async function tryPersonFactsFromName(name, lang) {
-  const n = normalizeWhitespace(name);
-  if (!looksLikePersonName(n)) return { ok: false, facts: [], person: null };
-
-  const cacheKey = `personfacts:${normalizeLang(lang)}:${n.toLowerCase()}`;
-  const cached = cacheGet(cacheKey);
-  if (cached) return cached;
-
-  const results = await wikidataSearch(n, lang);
-  if (!results.length) {
-    const out = { ok: false, facts: [], person: null };
-    cacheSet(cacheKey, out, config.geoCacheTtlMs);
-    return out;
-  }
-
-  // pick first non-sensitive result
-  let picked = null;
-  for (const r of results) {
-    const d = r?.description || "";
-    if (isSensitiveDescription(d)) continue;
-    picked = r;
-    break;
-  }
-  if (!picked) {
-    const out = { ok: false, facts: [], person: null };
-    cacheSet(cacheKey, out, config.geoCacheTtlMs);
-    return out;
-  }
-
-  const qid = picked.id;
-  const ent = await wikidataEntity(qid);
-  if (!ent) {
-    const out = { ok: false, facts: [], person: null };
-    cacheSet(cacheKey, out, config.geoCacheTtlMs);
-    return out;
-  }
-
-  const personLabel = labelFor(ent, lang) || picked.label || n;
-  const personDesc = descFor(ent, lang) || picked.description || "";
-
-  if (isSensitiveDescription(personDesc)) {
-    const out = { ok: false, facts: [], person: null };
-    cacheSet(cacheKey, out, config.geoCacheTtlMs);
-    return out;
-  }
-
+function buildFactStrings({ lang, personLabel, personDesc, bornStr, hasSpouse }) {
+  const l = normalizeLang(lang);
   const facts = [];
 
-  const born = getClaim(ent, "P569"); // date of birth
-  const bornStr = getTimeString(born);
-  if (bornStr) facts.push(safeFactLine(`${personLabel} נולד/ה ב-${bornStr}.`));
-
-  const occupation = getClaim(ent, "P106"); // occupation (qid)
-  if (occupation?.id) {
-    // We cannot reliably translate occupation without extra lookups, keep it subtle:
-    facts.push(safeFactLine(`${personLabel}: ${safeTrim(personDesc, 120)}.`));
-  } else if (personDesc) {
-    facts.push(safeFactLine(`${personLabel}: ${safeTrim(personDesc, 120)}.`));
+  if (bornStr) {
+    if (l === "he") facts.push(`${personLabel} נולד/ה ב-${bornStr}.`);
+    else if (l === "fr") facts.push(`${personLabel} est né(e) le ${bornStr}.`);
+    else facts.push(`${personLabel} was born on ${bornStr}.`);
   }
 
-  // spouse (personal-life juice) if present
-  const spouse = getClaim(ent, "P26");
-  if (spouse?.id) {
-    facts.push(safeFactLine(`פרט אישי קטן: היו לו/לה חיי זוגיות מתועדים ב-Wikidata.`));
+  if (personDesc) {
+    if (l === "he") facts.push(`${personLabel}: ${safeTrim(personDesc, 120)}.`);
+    else if (l === "fr") facts.push(`${personLabel}: ${safeTrim(personDesc, 120)}.`);
+    else facts.push(`${personLabel}: ${safeTrim(personDesc, 120)}.`);
   }
 
-  const cleanFacts = facts.filter(Boolean).slice(0, 3);
+  if (hasSpouse) {
+    if (l === "he") facts.push(`פרט אישי קטן: יש תיעוד לחיי זוגיות ב-Wikidata.`);
+    else if (l === "fr") facts.push(`Petit détail perso: une vie de couple est documentée sur Wikidata.`);
+    else facts.push(`Tiny personal detail: a documented spouse/partner exists on Wikidata.`);
+  }
 
-  const out = {
-    ok: cleanFacts.length > 0,
-    facts: cleanFacts,
-    person: {
-      qid,
-      label: personLabel,
-      description: personDesc,
-    },
-  };
+  return facts.map(safeFactLine).filter(Boolean).slice(0, 3);
+}
 
-  cacheSet(cacheKey, out, config.geoCacheTtlMs);
-  return out;
+async function wikidataSearch(name, lang) {
+  const l = normalizeLang(lang);
+  const url =
+    "https://www.wikidata.org/w/api.php" +
+    `?action=wbsearchentities&search=${encodeURIComponent(name)}` +
+    `&language=${encodeURIComponent(l)}` +
+    `&format=json&limit=5&origin=*`;
+
+  const r = await fetchJson(url, { timeoutMs: config.httpTimeoutMs });
+  if (!r.ok || !r.json) return [];
+  return Array.isArray(r.json.search) ? r.json.search : [];
+}
+
+async function wikidataEntity(qid) {
+  const url = `https://www.wikidata.org/wiki/Special:EntityData/${encodeURIComponent(qid)}.json`;
+  const r = await fetchJson(url, { timeoutMs: config.httpTimeoutMs });
+  if (!r.ok || !r.json) return null;
+  return r.json?.entities?.[qid] || null;
+}
+
+export async function tryPersonFactsFromName(name, lang = "en") {
+  try {
+    const n = normalizeWhitespace(name);
+    const l = normalizeLang(lang);
+
+    if (!looksLikePersonName(n)) return { ok: false, facts: [], person: null };
+
+    const cacheKey = `personfacts:${l}:${n.toLowerCase()}`;
+    const cached = cacheGet(cacheKey);
+    if (cached) return cached;
+
+    const results = await wikidataSearch(n, l);
+    if (!results.length) {
+      const out = { ok: false, facts: [], person: null };
+      cacheSet(cacheKey, out, config.geoCacheTtlMs);
+      return out;
+    }
+
+    let picked = null;
+    for (const r of results) {
+      const d = r?.description || "";
+      if (isSensitiveDescription(d)) continue;
+      picked = r;
+      break;
+    }
+
+    if (!picked) {
+      const out = { ok: false, facts: [], person: null };
+      cacheSet(cacheKey, out, config.geoCacheTtlMs);
+      return out;
+    }
+
+    const qid = picked.id;
+    const ent = await wikidataEntity(qid);
+    if (!ent) {
+      const out = { ok: false, facts: [], person: null };
+      cacheSet(cacheKey, out, config.geoCacheTtlMs);
+      return out;
+    }
+
+    const personLabel = labelFor(ent, l) || picked.label || n;
+    const personDesc = descFor(ent, l) || picked.description || "";
+
+    if (isSensitiveDescription(personDesc)) {
+      const out = { ok: false, facts: [], person: null };
+      cacheSet(cacheKey, out, config.geoCacheTtlMs);
+      return out;
+    }
+
+    const born = getClaim(ent, "P569");
+    const bornStr = getTimeString(born);
+
+    const spouse = getClaim(ent, "P26");
+    const hasSpouse = Boolean(spouse);
+
+    const facts = buildFactStrings({
+      lang: l,
+      personLabel,
+      personDesc,
+      bornStr,
+      hasSpouse,
+    });
+
+    const out = {
+      ok: facts.length > 0,
+      facts,
+      person: { qid, label: personLabel, description: personDesc },
+    };
+
+    cacheSet(cacheKey, out, config.geoCacheTtlMs);
+    return out;
+  } catch {
+    // Never fail the request because Wikidata had a bad day
+    return { ok: false, facts: [], person: null };
+  }
 }

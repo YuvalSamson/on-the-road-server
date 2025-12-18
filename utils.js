@@ -13,6 +13,10 @@ export class HttpError extends Error {
   }
 }
 
+export function nowIso() {
+  return new Date().toISOString();
+}
+
 export function safeTrim(s, maxLen = 400) {
   const str = String(s ?? "");
   if (str.length <= maxLen) return str;
@@ -28,7 +32,17 @@ export function makeLogger(prefix) {
 }
 
 export function assertFiniteNumber(v, name) {
-  const n = typeof v === "number" ? v : Number(v);
+  if (v == null) throw new HttpError(400, `Invalid ${name}`);
+
+  // Accept numbers, numeric strings, and strings with comma decimal (e.g. "31,89321")
+  let n;
+  if (typeof v === "number") {
+    n = v;
+  } else {
+    const s = String(v).trim().replace(",", ".");
+    n = Number(s);
+  }
+
   if (!Number.isFinite(n)) throw new HttpError(400, `Invalid ${name}`);
   return n;
 }
@@ -87,7 +101,12 @@ export async function fetchText(
 
 export async function fetchJson(
   url,
-  { timeoutMs = config.httpTimeoutMs, headers = {}, method = "GET", body = null } = {}
+  {
+    timeoutMs = config.httpTimeoutMs,
+    headers = {},
+    method = "GET",
+    body = null,
+  } = {}
 ) {
   const controller = new AbortController();
   const t = setTimeout(() => controller.abort(), timeoutMs);
