@@ -87,6 +87,141 @@ const placesCacheMemory = new Map(); // cache_key => pois[]
 const userPlacesHistoryMemory = new Map(); // userKey => Set(placeId)
 const wikidataFactsMemory = new Map(); // qid|lang => { facts, sources, meta }
 
+// ===== BTW story shaping =====
+const BTW_MIN_WORDS = 110;
+const BTW_MAX_WORDS = 190;
+
+function languageLabel(code) {
+  if (code === "he") return "עברית";
+  if (code === "fr") return "Français";
+  return "English";
+}
+
+function buildBtwPrompt({ languageCode, poiName, distanceText, factsText }) {
+  const lang = languageCode || "he";
+  const placeName = poiName || (lang === "he" ? "מקום לא ידוע" : "Unknown place");
+
+  if (lang === "en") {
+    return `
+You write BTW driving stories. Create one short, interesting story about a nearby place.
+
+Hard rules:
+1) Use ONLY the facts under FACTS. No guessing. No extra knowledge.
+2) No filler like "it changed over time", "it preserves history", "interesting fact:", "a reminder that...".
+3) No superlatives (amazing, incredible, crazy) and no dramatic hype.
+4) Safe for teens. If FACTS mention conflict or violence, refer to it briefly without graphic details.
+5) One paragraph only. No titles, no bullet points.
+6) Length: ${BTW_MIN_WORDS}-${BTW_MAX_WORDS} words.
+7) If FACTS are insufficient to write a meaningful story, output exactly: NO_STORY
+
+Structure:
+- 1-2 sentences to locate the driver: place name + distance.
+- 3-6 short beats, each with a concrete fact (year, event, name).
+- 1 closing sentence that brings it back to the road, non-poetic.
+
+Place: ${placeName}
+Distance: ${distanceText || "unknown"}
+
+FACTS:
+${factsText || ""}
+
+Return only the final story text.
+`.trim();
+  }
+
+  if (lang === "fr") {
+    return `
+Tu écris des histoires BTW pour la conduite. Crée une histoire courte et intéressante sur un lieu proche.
+
+Règles strictes:
+1) Utilise UNIQUEMENT les faits sous FACTS. Pas de suppositions, pas de connaissance externe.
+2) Pas de remplissage du type "ça a changé avec le temps", "ça préserve l'histoire", "fait intéressant:", "un rappel que...".
+3) Pas de superlatifs et pas de dramatisation.
+4) Safe pour des ados. Si FACTS mentionne un conflit ou une violence, reste bref et non-graphique.
+5) Un seul paragraphe. Pas de titre, pas de listes.
+6) Longueur: ${BTW_MIN_WORDS}-${BTW_MAX_WORDS} mots.
+7) Si FACTS ne suffit pas pour une histoire utile, retourne exactement: NO_STORY
+
+Structure:
+- 1-2 phrases pour situer: nom du lieu + distance.
+- 3-6 "beats" courts, chacun avec un fait concret (année, événement, nom).
+- 1 phrase de clôture qui revient à la route, sans poésie.
+
+Lieu: ${placeName}
+Distance: ${distanceText || "inconnue"}
+
+FACTS:
+${factsText || ""}
+
+Retourne seulement le texte final.
+`.trim();
+  }
+
+  // he
+  return `
+אתה כותב סיפורי BTW לנהיגה. תיצור סיפור קצר ומעניין על מקום קרוב.
+
+חוקים קשוחים:
+1) להשתמש רק בעובדות תחת FACTS. בלי לנחש, בלי להשלים ידע, בלי להמציא.
+2) בלי משפטי אוויר כמו "עבר שינויים", "משמר היסטוריה", "עובדה מעניינת:", "תזכורת ש...".
+3) בלי סופרלטיבים ובלי דרמה.
+4) בטוח לבני נוער. אם FACTS כולל סכסוך או אלימות, להזכיר בקצרה בלי תיאור גרפי.
+5) פסקה אחת בלבד. בלי כותרת, בלי רשימות.
+6) אורך: ${BTW_MIN_WORDS}-${BTW_MAX_WORDS} מילים.
+7) אם אין מספיק עובדות כדי לבנות סיפור משמעותי, תחזיר בדיוק: NO_STORY
+
+מבנה:
+- 1-2 משפטים שממקמים: שם המקום + מרחק.
+- 3-6 "ביטים" קצרים, כל אחד עם עובדה קונקרטית (שנה, אירוע, שם).
+- משפט סיום אחד שמחזיר לכביש, ענייני ולא מליצי.
+
+מקום: ${placeName}
+מרחק: ${distanceText || "לא ידוע"}
+
+FACTS:
+${factsText || ""}
+
+החזר רק את הסיפור הסופי.
+`.trim();
+}
+
+function normalizeFactLine(s) {
+  if (typeof s !== "string") return "";
+  const t = s.trim();
+  if (!t) return "";
+  return t.replace(/\s+/g, " ");
+}
+
+function buildFactsTextForModel({ language, poiName, distanceMetersApprox, facts }) {
+  const lines = [];
+  const name = poiName || "";
+  const dist = Number.isFinite(distanceMetersApprox) ? distanceMetersApprox : null;
+
+  if (language === "he") {
+    if (name) lines.push(`שם המקום: ${name}.`);
+    if (dist != null) lines.push(`מרחק מהנהג: בערך ${dist} מטר.`);
+  } else if (language === "fr") {
+    if (name) lines.push(`Nom du lieu: ${name}.`);
+    if (dist != null) lines.push(`Distance du conducteur: environ ${dist} mètres.`);
+  } else {
+    if (name) lines.push(`Place name: ${name}.`);
+    if (dist != null) lines.push(`Distance from the driver: about ${dist} meters.`);
+  }
+
+  const seen = new Set();
+  for (const f of Array.isArray(facts) ? facts : []) {
+    const x = normalizeFactLine(f);
+    if (!x) continue;
+    const k = x.toLowerCase();
+    if (seen.has(k)) continue;
+    seen.add(k);
+    lines.push(x);
+    if (lines.length >= 14) break;
+  }
+
+  return lines.join("\n");
+}
+
 function makeCacheKey(lat, lng, radiusMeters, mode = "interesting", language = "en") {
   const latKey = lat.toFixed(4);
   const lngKey = lng.toFixed(4);
@@ -573,7 +708,7 @@ LIMIT 1
       namedAfterQid: namedAfterQid || null,
     };
 
-    if (instance) facts.push(`Instance of: ${instance}.`);
+    if (instance) facts.push(`Instance: ${instance}.`);
     if (desc) facts.push(`Description: ${desc}.`);
     if (inceptionYear) facts.push(`Inception year: ${toYearString(inceptionYear)}.`);
     if (namedAfterLabel) facts.push(`Named after: ${namedAfterLabel}.`);
@@ -601,9 +736,6 @@ async function fetchPersonFacts(personQid, language = "en") {
   const cached = wikidataFactsMemory.get(cacheKey);
   if (cached) return cached;
 
-  // We intentionally pull "human" but safe details:
-  // occupation, positions held, notable works, awards, education, and a short description if available.
-  // We DO NOT pull explicit sexual content, and we don't invent anything beyond these facts.
   const query = `
 SELECT ?personLabel
        (GROUP_CONCAT(DISTINCT ?occupationLabel; separator=" | ") AS ?occupations)
@@ -688,8 +820,7 @@ LIMIT 1
   }
 }
 
-
-// ===== Wikipedia summary fallback (from OSM wikipedia tag) =====
+// ===== Wikipedia summary fallback (from OSM wikipedia tag OR Wikidata sitelinks) =====
 function parseWikipediaTag(wikipediaTag) {
   // Returns {lang, title} or null
   if (typeof wikipediaTag !== "string") return null;
@@ -709,15 +840,9 @@ function parseWikipediaTag(wikipediaTag) {
   return { lang: "en", title: trimmed.replaceAll(" ", "_") };
 }
 
-async function fetchWikipediaSummaryFacts(wikipediaTag, language = "en") {
-  const parsed = parseWikipediaTag(wikipediaTag);
-  if (!parsed) return { facts: [], sources: [] };
+async function fetchWikipediaSummaryByLangTitle(lang, title) {
+  if (!lang || !title) return { facts: [], sources: [] };
 
-  // Prefer tag language, else fallback to requested language, else en
-  const lang = parsed.lang || (language === "he" ? "he" : "en");
-  const title = parsed.title;
-
-  // Wikipedia REST summary API
   const url = `https://${lang}.wikipedia.org/api/rest_v1/page/summary/${encodeURIComponent(title)}`;
 
   try {
@@ -737,31 +862,92 @@ async function fetchWikipediaSummaryFacts(wikipediaTag, language = "en") {
 
     const data = await resp.json();
 
-    // Use only the first 1-2 sentences to keep it factual and compact
     const extract = typeof data.extract === "string" ? data.extract.trim() : "";
     if (!extract) return { facts: [], sources: [] };
 
-    // Split into sentences naively (good enough)
+    // Keep first 2 sentences only
     const parts = extract.split(/(?<=[.!?])\s+/).filter(Boolean);
     const short = parts.slice(0, 2).join(" ").trim();
-
     if (!short) return { facts: [], sources: [] };
 
-    const facts = [`Wikipedia summary: ${short}`];
-
-    // Add title as a fact too (helps model stay anchored)
-    const titleHuman = (typeof data.title === "string" && data.title.trim()) ? data.title.trim() : title.replaceAll("_", " ");
-    facts.unshift(`Wikipedia page title: ${titleHuman}.`);
+    const titleHuman =
+      (typeof data.title === "string" && data.title.trim())
+        ? data.title.trim()
+        : title.replaceAll("_", " ");
 
     const pageUrl =
-      (typeof data.content_urls?.desktop?.page === "string" && data.content_urls.desktop.page) ||
-      `https://${lang}.wikipedia.org/wiki/${title}`;
+      (typeof data.content_urls?.desktop?.page === "string" && data.content_urls.desktop.page)
+        ? data.content_urls.desktop.page
+        : `https://${lang}.wikipedia.org/wiki/${title}`;
+
+    const facts = [
+      `Wikipedia page title: ${titleHuman}.`,
+      `Wikipedia summary: ${short}`,
+    ];
 
     const sources = [{ type: "wikipedia", lang, title: titleHuman, url: pageUrl }];
 
     return { facts: facts.slice(0, 3), sources };
-  } catch (e) {
+  } catch {
     return { facts: [], sources: [] };
+  }
+}
+
+async function fetchWikipediaSummaryFacts(wikipediaTag, language = "en") {
+  const parsed = parseWikipediaTag(wikipediaTag);
+  if (!parsed) return { facts: [], sources: [] };
+
+  const langFromTag = parsed.lang || "";
+  const fallbackLang = language === "he" ? "he" : (language === "fr" ? "fr" : "en");
+  const lang = langFromTag || fallbackLang;
+  const title = parsed.title;
+
+  return fetchWikipediaSummaryByLangTitle(lang, title);
+}
+
+async function fetchWikipediaTitleFromWikidata(qid, preferredLang = "en") {
+  if (!qid) return null;
+
+  const cacheKey = `wd_sitelink:${qid}|${preferredLang}`;
+  const cached = wikidataFactsMemory.get(cacheKey);
+  if (cached) return cached;
+
+  const url = `https://www.wikidata.org/wiki/Special:EntityData/${encodeURIComponent(qid)}.json`;
+
+  try {
+    const resp = await abortableFetch(
+      url,
+      {
+        method: "GET",
+        headers: {
+          "Accept": "application/json",
+          "User-Agent": "btw-ontheroad-server/1.0 (contact: none)",
+        },
+      },
+      9000
+    );
+
+    if (!resp.ok) return null;
+
+    const data = await resp.json();
+    const entity = data?.entities?.[qid];
+    const sitelinks = entity?.sitelinks || {};
+
+    const pref = preferredLang === "he" ? "hewiki" : (preferredLang === "fr" ? "frwiki" : "enwiki");
+    const fallbacks = [pref, "hewiki", "enwiki", "frwiki"];
+
+    for (const key of fallbacks) {
+      const title = sitelinks?.[key]?.title;
+      if (typeof title === "string" && title.trim()) {
+        const result = { lang: key === "hewiki" ? "he" : (key === "frwiki" ? "fr" : "en"), title };
+        wikidataFactsMemory.set(cacheKey, result);
+        return result;
+      }
+    }
+
+    return null;
+  } catch {
+    return null;
   }
 }
 
@@ -877,7 +1063,7 @@ async function pickBestPoiForUser(pois, lat, lng, userKey, language) {
   if (!pois || pois.length === 0) return null;
 
   const heardSet = await getHeardSetForUser(userKey);
-  const lang = language === "he" ? "he" : "en";
+  const lang = language === "he" ? "he" : (language === "fr" ? "fr" : "en");
 
   // Start with nearby + unseen candidates
   const raw = [];
@@ -898,7 +1084,6 @@ async function pickBestPoiForUser(pois, lat, lng, userKey, language) {
     raw.push({ p, d, qid });
   }
 
-  // Sort by distance first, then we enrich facts for top ones
   raw.sort((a, b) => a.d - b.d);
 
   const enriched = [];
@@ -931,13 +1116,12 @@ async function pickBestPoiForUser(pois, lat, lng, userKey, language) {
     const hardAnchors = countHardAnchors(meta);
     const factsCount = facts.length;
 
-    // Quality gate (relaxed): we prefer strong anchors, but we don't want to go silent in most areas.
-    // Accept if:
+    // Quality gate:
     // - at least 4 facts and at least 1 hard anchor, OR
     // - at least 6 facts even without anchors.
     let ok = (factsCount >= 4 && hardAnchors >= 1) || (factsCount >= 6);
 
-    // If Wikidata is weak or missing, try Wikipedia via OSM wikipedia tag (still factual, with source).
+    // If weak, try Wikipedia via OSM wikipedia tag
     if (!ok) {
       const wikiTag = typeof c.p.wikipedia === "string" ? c.p.wikipedia : null;
       if (wikiTag) {
@@ -951,15 +1135,29 @@ async function pickBestPoiForUser(pois, lat, lng, userKey, language) {
       ok = (factsCount2 >= 3 && hardAnchors >= 1) || (factsCount2 >= 5);
     }
 
+    // Still weak: try Wikidata sitelinks -> Wikipedia summary
+    if (!ok && qid) {
+      const sl = await fetchWikipediaTitleFromWikidata(qid, lang);
+      if (sl && sl.title) {
+        const wr2 = await fetchWikipediaSummaryByLangTitle(sl.lang, sl.title.replaceAll(" ", "_"));
+        if (Array.isArray(wr2.facts) && wr2.facts.length > 0) {
+          facts = facts.concat(wr2.facts);
+          sources = sources.concat(wr2.sources || []);
+        }
+      }
+      const factsCount3 = facts.length;
+      ok = (factsCount3 >= 3 && hardAnchors >= 1) || (factsCount3 >= 5);
+    }
+
     if (!ok) continue;
 
-    const score = computeFactScore(c.d, meta, factsCount);
+    const score = computeFactScore(c.d, meta, facts.length);
 
     enriched.push({
       p: c.p,
       d: c.d,
       qid,
-      facts: facts.slice(0, 9),
+      facts: facts.slice(0, 12),
       sources,
       meta,
       score,
@@ -972,67 +1170,45 @@ async function pickBestPoiForUser(pois, lat, lng, userKey, language) {
   return enriched[0];
 }
 
-// ===== System message: facts only, no hype, no opinions =====
+// ===== System message: keep it controlled, story prompt carries most logic =====
 function getSystemMessage(language) {
-  if (language === "en") {
+  const lang = language === "he" ? "he" : (language === "fr" ? "fr" : "en");
+
+  if (lang === "en") {
     return `
-You are a factual narrator for a driving app.
+You are a careful driving-story writer.
 
-Truth rules:
-- Use ONLY the facts provided under FACTS.
-- If a detail is not in FACTS, do not state it as fact.
-- No hype, no opinions, no superlatives. Avoid adjectives like "beautiful", "amazing", "famous", "vibrant".
-- Each sentence must contain at least one concrete fact (a name, year, number, title, designation, or the distance).
-- Avoid graphic violence or sexual content. Keep it safe for teens.
-
-Output rules:
-- If FACTS include a human-person detail (occupation, award, notable work, position), the last sentence MUST be a light punchline based on that fact (still factual).
-- Exactly one paragraph.
-- 60 to 120 words.
-- No greeting.
-- Use commas and occasional ellipses to help natural speech.
-- Start immediately with the strongest fact.
+Core rules:
+- Use ONLY the provided FACTS. If it is not in FACTS, do not state it.
+- No filler, no hype, no superlatives.
+- One paragraph, no headings, no lists.
+- Safe for teens. If facts mention violence, keep it brief and non-graphic.
+- If you cannot write a meaningful story from FACTS, output exactly: NO_STORY
 `.trim();
   }
 
-  if (language === "fr") {
+  if (lang === "fr") {
     return `
-Tu es un narrateur factuel pour une application de conduite.
+Tu es un rédacteur prudent d'histoires pour la conduite.
 
-Règles de vérité:
-- Utilise UNIQUEMENT les faits sous FACTS.
-- Si ce n'est pas dans FACTS, ne l'affirme pas.
-- Zéro hype, zéro opinion, pas de superlatifs. Évite "magnifique", "incroyable", "célèbre", etc.
-- Chaque phrase doit contenir au moins un fait concret (nom, année, nombre, titre, désignation, ou la distance).
-- Évite la violence graphique et le contenu sexuel. Reste safe pour des ados.
-
-Règles de sortie:
-- Si FACTS incluent un détail humain sur une personne (métier, prix, œuvre, poste), la dernière phrase doit être une petite chute basée sur ce fait (tout en restant factuelle).
-- Un seul paragraphe.
-- 60 à 120 mots.
-- Pas de salutation.
-- Utilise des virgules et parfois des points de suspension (...) pour aider la voix.
-- Commence directement par le fait le plus fort.
+Règles:
+- Utilise UNIQUEMENT les FACTS fournis. Sinon, ne l'affirme pas.
+- Pas de remplissage, pas de hype, pas de superlatifs.
+- Un seul paragraphe, pas de titre, pas de listes.
+- Safe pour des ados. Si FACTS mentionne une violence, reste bref et non-graphique.
+- Si tu ne peux pas écrire une histoire utile à partir de FACTS, retourne exactement: NO_STORY
 `.trim();
   }
 
   return `
-אתה קריין עובדתי לאפליקציית נהיגה.
+אתה כותב סיפורי נהיגה בזהירות.
 
-חוקי אמת:
-- אתה משתמש רק בעובדות שניתנו לך תחת FACTS.
-- אם פרט לא נמצא ב-FACTS אסור לך להציג אותו כעובדה.
-- אפס סופרלטיבים, אפס דעות, אפס "מדהים/יפה/מפורסם". לא להשתמש בתיאורי רושם.
-- כל משפט חייב לכלול לפחות עובדה קונקרטית אחת (שם, שנה, מספר, תפקיד, סטטוס, או המרחק).
-- לא להכניס אלימות גרפית או תוכן מיני. זה חייב להיות בטוח לבני נוער.
-
-חוקי פלט:
-- אם ב-FACTS יש פרט אנושי על אדם (מקצוע, פרס, יצירה, תפקיד), המשפט האחרון חייב להיות פאנץ' קטן שמבוסס על העובדה הזאת, ועדיין עובדתי.
-- פסקה אחת בלבד.
-- 60 עד 120 מילים.
-- בלי ברכות פתיחה.
-- להשתמש בפסיקים ולעיתים בשלוש נקודות (...) כדי לעזור לקריינות אנושית.
-- להתחיל ישר בעובדה הכי חזקה.
+חוקים:
+- להשתמש רק ב-FACTS. אם פרט לא מופיע שם, אסור לקבוע אותו.
+- בלי מילוי, בלי דרמה, בלי סופרלטיבים.
+- פסקה אחת, בלי כותרות ובלי רשימות.
+- בטוח לבני נוער. אם FACTS כולל אלימות, לציין בקצרה בלי תיאור גרפי.
+- אם אי אפשר לכתוב סיפור שימושי מתוך FACTS, תחזיר בדיוק: NO_STORY
 `.trim();
 }
 
@@ -1082,7 +1258,7 @@ app.post("/api/story-both", async (req, res) => {
     let best = null;
 
     for (const r of radii) {
-      const pois = await getNearbyPois(lat, lng, r, "interesting", language === "he" ? "he" : "en");
+      const pois = await getNearbyPois(lat, lng, r, "interesting", language === "he" ? "he" : (language === "fr" ? "fr" : "en"));
       best = await pickBestPoiForUser(pois, lat, lng, userKey, language);
       if (best) break;
     }
@@ -1093,36 +1269,38 @@ app.post("/api/story-both", async (req, res) => {
 
     const poi = best.p;
     const distExact = best.d;
-    const distApprox = approxDistanceMeters(distExact, 50); // user chose 50m rounding
-    const distText = distApprox != null ? `${distApprox}` : `${Math.round(distExact)}`;
+    const distApprox = approxDistanceMeters(distExact, 50);
+    const distText = distApprox != null ? `${distApprox} מטר` : `${Math.round(distExact)} מטר`;
 
-    // Facts pack for model (facts-only)
+    // Facts for model
     const facts = Array.isArray(best.facts) ? best.facts : [];
-    const factsLines = facts.slice(0, 9).map((f, i) => `FACT ${i + 1}: ${f}`);
+    const factsText = buildFactsTextForModel({
+      language,
+      poiName: poi.name,
+      distanceMetersApprox: distApprox,
+      facts,
+    });
 
-    // Add distance as a fact (rounded)
-    factsLines.unshift(`FACT 0: Distance from the driver: about ${distText} meters.`);
-
-    const poiLine = `Point of interest: "${poi.name}".`;
-
-    const userMessage = `
-${poiLine}
-FACTS:
-${factsLines.join("\n")}
-User request: ${prompt}
-`.trim();
+    const btwPrompt = buildBtwPrompt({
+      languageCode: language,
+      poiName: poi.name,
+      distanceText: language === "he" ? distText : (language === "fr" ? distText.replace("מטר", "mètres") : distText.replace(" מטר", " meters")),
+      factsText,
+    });
 
     const completion = await openai.chat.completions.create({
       model: "gpt-4.1-mini",
       messages: [
         { role: "system", content: getSystemMessage(language) },
-        { role: "user", content: userMessage },
+        { role: "user", content: btwPrompt },
       ],
-      temperature: 0.35,
+      temperature: 0.4,
+      max_tokens: 650,
     });
 
     const storyText = completion.choices[0]?.message?.content?.trim();
     if (!storyText) throw new Error("No story generated by OpenAI");
+
     if (storyText === "NO_STORY") {
       return res.json({ shouldSpeak: false, reason: "model_no_story", language });
     }
@@ -1155,7 +1333,7 @@ User request: ${prompt}
 app.get("/health", (req, res) => {
   res.json({
     status: "ok",
-    build: "btw-facts-only-round50-wiki-fallback-relaxedgate-words120-tts-v1",
+    build: "btw-better-storyprompt-words190-wiki-sitelink-fallback-tts-v2",
   });
 });
 
