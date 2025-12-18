@@ -56,14 +56,13 @@ app.post("/api/story-both", async (req, res) => {
     const lat = assertFiniteNumber(req.body?.lat, "lat");
     const lng = assertFiniteNumber(req.body?.lng, "lng");
 
-    // The app should send a 2-letter language code (e.g. "he", "en", "fr").
-    // We accept a few common keys to be resilient.
+    // App sends language code like "he" / "en" / "fr"
     const langRaw =
       (req.body?.lang ??
         req.body?.language ??
         req.body?.locale ??
         req.body?.speechLang) || "en";
-    const lang = String(langRaw).toLowerCase().slice(0, 5); // allow "pt-br" etc.
+    const lang = String(langRaw).toLowerCase().slice(0, 5);
 
     const userId = req.body?.userId ? String(req.body.userId) : null;
     const tasteProfileId = req.body?.tasteProfileId
@@ -75,8 +74,10 @@ app.post("/api/story-both", async (req, res) => {
       tasteProfileId,
     });
 
-    const poiPick = await findBestPoi({ lat, lng, userId });
+    // IMPORTANT: pass lang so reverse-geocode/anchor is in the right language
+    const poiPick = await findBestPoi({ lat, lng, userId, lang });
 
+    // We keep the same response shape but now poiPick should almost always be shouldSpeak=true
     if (!poiPick.shouldSpeak) {
       await logStory({
         userId,
@@ -100,20 +101,15 @@ app.post("/api/story-both", async (req, res) => {
         poi: poiPick.poi ?? null,
         lang,
 
-        // Backward compatibility for the app:
         text: "",
         storyText: "",
         audioBase64: "",
         audioContentType: "",
-
-        // New structured audio (optional for client):
         audio: null,
       });
     }
 
     const poi = poiPick.poiWithFacts;
-
-    // IMPORTANT: story generation is async now because we force the language via OpenAI.
     const storyText = await generateStoryText({ poi, taste, lang });
 
     const audioBuf = await synthesizeTts(storyText, { lang });
@@ -129,7 +125,7 @@ app.post("/api/story-both", async (req, res) => {
       poiSource: poi.source ?? null,
       distanceMeters: poi.distanceMetersApprox ?? null,
       shouldSpeak: true,
-      reason: "ok",
+      reason: poiPick.reason || "ok",
       tasteProfileId: tpId,
       storyLen: storyText.length,
     });
@@ -139,7 +135,7 @@ app.post("/api/story-both", async (req, res) => {
     return res.status(200).json({
       version: config.version,
       shouldSpeak: true,
-      reason: "ok",
+      reason: poiPick.reason || "ok",
       distanceMetersApprox: poi.distanceMetersApprox ?? null,
       lang,
       poi: {
@@ -149,16 +145,16 @@ app.post("/api/story-both", async (req, res) => {
         description: poi.description ?? null,
         wikipediaUrl: poi.wikipediaUrl ?? null,
         imageUrl: poi.imageUrl ?? null,
+        anchor: poi.anchor ?? null,
       },
-      facts: (poi.facts || []).slice(0, 6),
+      facts: (poi.facts || []).slice(0, 8),
 
-      // Backward compatibility for the app:
+      // Backward compatibility for the app
       text: storyText,
       storyText,
       audioBase64,
       audioContentType,
 
-      // New structured audio (optional for client):
       audio: {
         contentType: audioContentType,
         base64: audioBase64,
