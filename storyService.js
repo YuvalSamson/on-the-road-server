@@ -1,8 +1,11 @@
 /**
  * storyService.js (ESM)
  *
- * No disallowSexualContent logic.
- * Keeps it PG by prompt rules, and avoids sensitive/hot-button topics.
+ * Contract-driven micro-stories for BYTHEWAY:
+ * - 4-6 sentences, each adds new info.
+ * - No generic "bonus knowledge" unless a clear contextual note is provided.
+ * - No hype / marketing clichés.
+ * - Use ONLY provided facts for place-specific claims.
  */
 
 import { config } from "./config.js";
@@ -41,53 +44,59 @@ function isSensitiveLine(s) {
   return bad.some((re) => re.test(t));
 }
 
-function cleanFacts(poi, max = 10) {
-  const facts = Array.isArray(poi?.facts) ? poi.facts : [];
-  return facts
+// Removes low-signal rating/review lines when review-count is small.
+// Example patterns we see in facts:
+// - "Rating: 5, reviews: 1"
+// - "דירוג 5 ומספר ביקורות 1"
+function isTinyReviewLine(s) {
+  const t = String(s || "");
+  // English-ish
+  const m1 = t.match(/reviews?\s*[:=]?\s*(\d{1,4})/i);
+  // Hebrew-ish
+  const m2 = t.match(/ביקורות?\s*[:=]?\s*(\d{1,4})/i);
+  const n = Number(m1?.[1] || m2?.[1] || NaN);
+  if (!Number.isFinite(n)) return false;
+  return n < 20;
+}
+
+// Optional contextual note: only if there's a clear link.
+// Keep this very conservative. If in doubt, return "".
+function contextualNote({ lang, poi, facts }) {
+  const l = normalizeLang(lang);
+  const text = `${poi?.label || ""} ${poi?.anchor?.areaLabel || ""} ${facts.join(" ")}`.toLowerCase();
+
+  // Clear navigation context
+  const navHints = ["gps", "navigation", "wayfinding", "waze", "maps", "מפה", "ניווט", "gps", "ווייז", "מפות"];
+  const hasNav = navHints.some((k) => text.includes(k));
+  if (hasNav) {
+    if (l === "he") return "טיפ ניווט קצר: בעיר GPS לפעמים מזייף כמה מטרים, אז עדיף להיצמד לכתובת ולשילוט.";
+    if (l === "fr") return "Astuce navigation: en ville, le GPS peut décaler de quelques mètres, fiez-vous aussi à l’adresse et au panneau.";
+    return "Navigation tip: in cities, GPS can drift by a few meters, so use the street address and signage too.";
+  }
+
+  // Nature/park context
+  const natureHints = ["park", "trail", "viewpoint", "garden", "forest", "parc", "sentier", "תצפית", "פארק", "שביל", "גן", "יער"];
+  const hasNature = natureHints.some((k) => text.includes(k));
+  if (hasNature) {
+    // Only if it's truly nature-related.
+    if (l === "he") return "אם בא לך רגע שקט: עצירה של 60 שניות בלי מסך עושה פלאים לנוף.";
+    if (l === "fr") return "Si vous voulez une vraie pause: 60 secondes sans écran changent la manière dont on voit le paysage.";
+    return "If you want a real reset: 60 seconds without your screen changes how the view feels.";
+  }
+
+  return "";
+}
+
+function cleanFacts(poi, extraFacts = [], max = 10) {
+  const base = Array.isArray(poi?.facts) ? poi.facts : [];
+  const merged = [...base, ...(Array.isArray(extraFacts) ? extraFacts : [])];
+
+  return merged
     .map((x) => (typeof x === "string" ? x.trim() : ""))
     .filter(Boolean)
     .filter((x) => !isSensitiveLine(x))
+    .filter((x) => !isTinyReviewLine(x))
     .slice(0, max);
-}
-
-function hashToIndex(seed, mod) {
-  const s = String(seed || "");
-  let h = 2166136261;
-  for (let i = 0; i < s.length; i++) {
-    h ^= s.charCodeAt(i);
-    h = Math.imul(h, 16777619);
-  }
-  return Math.abs(h) % mod;
-}
-
-const NUGGETS = {
-  he: [
-    "בונוס ידע: GPS לבד יכול לטעות בכמה מטרים, ושילוב עם Wi-Fi וסלולר בדרך כלל משפר דיוק בעיר.",
-    "בונוס ידע: באוכל, חריפות של פלפל היא תחושת חום-כאב, לא 'טעם' רגיל.",
-    "בונוס ידע: במוזיקה, שינוי קטן בטמפו יכול לגרום לשיר להרגיש אחר לגמרי בלי לשנות את המנגינה.",
-    "בונוס ידע: בטכנולוגיה, דחיסה חכמה חוסכת רוחב פס הרבה יותר ממה שחושבים, במיוחד באודיו.",
-    "בונוס ידע: בטבע, הרבה צמחים מגיבים לאור ולחום יותר מאשר לשעה ביום.",
-  ],
-  en: [
-    "Knowledge bonus: GPS alone can be off by several meters, and adding Wi-Fi and cell data often improves city accuracy.",
-    "Knowledge bonus: Chili “heat” is a heat-pain sensation, not a classic taste.",
-    "Knowledge bonus: In music, a small tempo change can make a track feel totally different without changing the melody.",
-    "Knowledge bonus: In tech, smart compression saves a surprising amount of bandwidth, especially for audio.",
-    "Knowledge bonus: In nature, many plants respond more to light and temperature than to clock time.",
-  ],
-  fr: [
-    "Bonus savoir: Le GPS seul peut dévier de plusieurs mètres, et le Wi-Fi plus le réseau améliorent souvent la précision en ville.",
-    "Bonus savoir: Le piquant du piment est une sensation de chaleur, pas un goût classique.",
-    "Bonus savoir: En musique, un léger changement de tempo peut transformer l’énergie sans toucher à la mélodie.",
-    "Bonus savoir: En tech, une bonne compression économise beaucoup de bande passante, surtout pour l’audio.",
-    "Bonus savoir: Dans la nature, beaucoup de plantes réagissent plus à la lumière et à la température qu’à l’heure.",
-  ],
-};
-
-function generalNugget(lang, seed) {
-  const l = normalizeLang(lang);
-  const list = NUGGETS[l] || NUGGETS.en;
-  return list[hashToIndex(seed, list.length)];
 }
 
 function fallbackStory({ poi, lang }) {
@@ -95,22 +104,21 @@ function fallbackStory({ poi, lang }) {
   const anchor = poi?.anchor?.areaLabel ? stripCommaSuffix(poi.anchor.areaLabel) : "";
   const name = poi?.label ? stripCommaSuffix(poi.label) : "";
   const where = anchor || name || (l === "he" ? "האזור הזה" : l === "fr" ? "ce coin" : "this area");
-  const nugget = generalNugget(l, `${where}|${l}`);
 
   if (l === "he") {
     return safeTrim(
-      `עצרנו ליד ${where}. אין לי כרגע מספיק עובדות ניטרליות וחזקות על נקודה ספציפית ממש פה כדי להיות מדויק, אז אני לא ממציא. ${nugget}`,
+      `עצרנו ליד ${where}. אין לי כרגע עובדה חזקה ומדויקת ממש על הנקודה הזאת, אז אני לא ממציא. אם תרצה, נסה להזיז את המפה מעט או לבחור נקודת עניין קרובה יותר.`,
       1400
     );
   }
   if (l === "fr") {
     return safeTrim(
-      `On est près de ${where}. Je n’ai pas assez de faits neutres et solides sur un point précis ici, donc je n’invente rien. ${nugget}`,
+      `On est près de ${where}. Je n’ai pas de fait solide et précis sur ce point exact, donc je n’invente rien. Si vous voulez, déplacez un peu la carte ou choisissez un lieu tout proche.`,
       1400
     );
   }
   return safeTrim(
-    `We’re near ${where}. I don’t have enough neutral, solid facts about a specific spot right here, so I won’t make things up. ${nugget}`,
+    `We’re near ${where}. I don’t have a solid, precise fact about this exact spot, so I won’t make things up. If you want, nudge the map a bit or pick a nearby point of interest.`,
     1400
   );
 }
@@ -123,7 +131,7 @@ async function openaiChat({ system, user }) {
 
   const payload = {
     model,
-    temperature: 0.55,
+    temperature: 0.45,
     messages: [
       { role: "system", content: system },
       { role: "user", content: user },
@@ -148,14 +156,25 @@ async function openaiChat({ system, user }) {
   return String(json?.choices?.[0]?.message?.content ?? "");
 }
 
-export async function generateStoryText({ poi, taste, lang = "en" }) {
+/**
+ * generateStoryText
+ * @param {object} args
+ * @param {object} args.poi
+ * @param {object} args.taste
+ * @param {string} args.lang
+ * @param {string[]} [args.extraFacts] - optional additional facts, for example from wikiService nearby context
+ * @param {boolean} [args.allowContextNote] - default true. If false, never adds contextual note.
+ */
+export async function generateStoryText({ poi, taste, lang = "en", extraFacts = [], allowContextNote = true }) {
   const l = normalizeLang(lang);
-  const facts = cleanFacts(poi, 10);
+  const facts = cleanFacts(poi, extraFacts, 12);
 
+  // Minimum: need at least 2 facts to avoid fluff.
   if (facts.length < 2) return fallbackStory({ poi, lang: l });
 
-  const humor = Number.isFinite(Number(taste?.humor)) ? Number(taste.humor) : 0.55;
-  const nugget = generalNugget(l, `${poi?.label || ""}|${poi?.anchor?.areaLabel || ""}|${l}`);
+  const humor = Number.isFinite(Number(taste?.humor)) ? Number(taste.humor) : 0.35;
+
+  const note = allowContextNote ? contextualNote({ lang: l, poi, facts }) : "";
 
   const system = [
     `You write micro-stories for a travel app named BYTHEWAY.`,
@@ -163,23 +182,28 @@ export async function generateStoryText({ poi, taste, lang = "en" }) {
     `Hard rules:`,
     `- NO politics, NO conflict/war, NO ethnic/religious tension, NO controversy.`,
     `- Keep it PG. No sexual content and no explicit intimacy.`,
-    `- Use ONLY the provided facts for place-specific claims.`,
-    `- Do not invent history, events, vibes, or claims about the place.`,
-    `Style (BYTHEWAY):`,
-    `- 90-150 words total.`,
-    `- First sentence: sharp hook, simple, slightly playful.`,
-    `- Include 2-4 facts from the list (paraphrase ok).`,
-    `- Include exactly 1 gentle smile-worthy line (not forced).`,
-    `Knowledge enrichment:`,
-    `- Add exactly 1 generic knowledge nugget as a single sentence.`,
-    `Formatting: plain text, no bullets, no emojis.`,
+    `- Use ONLY the provided facts for place-specific claims. Do not invent.`,
+    `Story contract (must follow):`,
+    `- 4 to 6 sentences total. Plain text, no bullets, no emojis.`,
+    `- Sentence 1: sharp hook that justifies stopping here (no clichés).`,
+    `- Include exactly one concrete, sensory detail (from facts) that paints a picture.`,
+    `- If any fact explains the name (meaning / named after), include it in one sentence.`,
+    `- Include one surprising, true anecdote from the facts (one sentence).`,
+    `- End with one practical action the user can do now in 3 to 10 minutes.`,
+    `- Each sentence must add new information. Remove filler.`,
+    `- Avoid hype words like: perfect, magical, must-see, unforgettable.`,
+    `Optional contextual note:`,
+    `- If a "Contextual note" line is provided, you MAY append it as the last sentence ONLY if it clearly connects to the place.`,
+    `- If no note is provided, do not add any general knowledge.`,
+    `Tone: practical, friendly, slightly playful but not forced.`,
   ].join(" ");
 
   const user = [
     `Anchor label: ${poi?.anchor?.areaLabel || ""}`,
     `Place name: ${poi?.label || ""}`,
-    `Facts:\n${facts.map((f, i) => `${i + 1}. ${f}`).join("\n")}`,
-    `Knowledge nugget (must include exactly one sentence): ${nugget}`,
+    `Facts (use only these for claims):`,
+    facts.map((f, i) => `${i + 1}. ${f}`).join("\n"),
+    note ? `Contextual note (optional, only if clearly connected): ${note}` : `Contextual note: (none)`,
     `Humor level (0-1): ${humor}`,
     `Write the story now.`,
   ].join("\n");
@@ -187,5 +211,11 @@ export async function generateStoryText({ poi, taste, lang = "en" }) {
   const out = await openaiChat({ system, user });
   const trimmed = safeTrim(out, 1400);
   if (!trimmed) throw new HttpError(500, "Empty story text from OpenAI");
+
+  // Guardrail: reject if model sneaks in "bonus" lines when not allowed.
+  if (!note && /בונוס|knowledge bonus|bonus savoir/i.test(trimmed)) {
+    return safeTrim(trimmed.replace(/(^|\s)(בונוס.*$|knowledge bonus.*$|bonus savoir.*$)/gim, "").trim(), 1400);
+  }
+
   return trimmed;
 }
