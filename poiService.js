@@ -10,6 +10,7 @@
  * Notes:
  * - Avoid low-signal rating facts when reviews are tiny (< 20).
  * - Keep facts compact and actually useful for the story contract.
+ * - Debug: set DEBUG_WIKI_CONTEXT=1 to log raw wiki context + final facts.
  */
 
 import { config } from "./config.js";
@@ -24,6 +25,9 @@ import {
   makeLogger,
 } from "./utils.js";
 import { tryPersonFactsFromName, getNearbyWikiContext } from "./wikiService.js";
+
+const log = makeLogger("poiService");
+const DEBUG_WIKI_CONTEXT = config.debugWikiContext === true || process.env.DEBUG_WIKI_CONTEXT === "1";
 
 function normalizeLang(lang) {
   const v = String(lang || "en").toLowerCase();
@@ -60,14 +64,9 @@ function streetForPersonLookup(street) {
   const s = normalizeWhitespace(String(street || ""));
   if (!s) return "";
 
-  // Drop comma suffixes and typical labels
   let t = stripCommaSuffix(s);
   t = t.replace(/^(רחוב|שדרות|שד'|שד׳|דרך|כביש)\s+/i, "").trim();
-
-  // Remove trailing house number patterns: "בן גוריון 11", "Ben-Gurion St 11"
   t = t.replace(/\s+\d{1,5}[a-zא-ת]?\s*$/i, "").trim();
-
-  // Remove common short suffixes
   t = t.replace(/\b(street|st\.|st|ave\.|ave|road|rd\.|rd|blvd\.|blvd)\b/gi, "").trim();
 
   return safeTrim(normalizeWhitespace(t), 80);
@@ -108,9 +107,7 @@ async function reverseGeocodeGoogle({ lat, lng, lang }) {
 
   const res = Array.isArray(r.json.results) ? r.json.results : [];
   const best = res[0];
-  const comps = Array.isArray(best?.address_components)
-    ? best.address_components
-    : [];
+  const comps = Array.isArray(best?.address_components) ? best.address_components : [];
 
   const getComp = (type) => {
     const c = comps.find((x) => Array.isArray(x.types) && x.types.includes(type));
@@ -124,9 +121,7 @@ async function reverseGeocodeGoogle({ lat, lng, lang }) {
   const country = getComp("country");
 
   const street = normalizeWhitespace([route, streetNumber].filter(Boolean).join(" "));
-  const areaLabel = normalizeWhitespace(
-    [street || neighborhood, locality, country].filter(Boolean).join(", ")
-  );
+  const areaLabel = normalizeWhitespace([street || neighborhood, locality, country].filter(Boolean).join(", "));
 
   const out = {
     provider: "google",
@@ -168,9 +163,7 @@ async function reverseGeocodeOSM({ lat, lng, lang }) {
   const country = addr.country || "";
 
   const street = normalizeWhitespace([road, houseNumber].filter(Boolean).join(" "));
-  const areaLabel = normalizeWhitespace(
-    [street || neighborhood, city, country].filter(Boolean).join(", ")
-  );
+  const areaLabel = normalizeWhitespace([street || neighborhood, city, country].filter(Boolean).join(", "));
 
   const out = {
     provider: "osm",
@@ -275,21 +268,18 @@ function placeFacts({ p, lang, dist }) {
   const l = normalizeLang(lang);
   const facts = [];
 
-  // Distance is usually useful and safe.
   if (Number.isFinite(dist) && dist !== null) {
     if (l === "he") facts.push(`בערך ${dist} מטר מפה.`);
     else if (l === "fr") facts.push(`À environ ${dist} m d’ici.`);
     else facts.push(`About ${dist} meters from here.`);
   }
 
-  // Vicinity gives context without hype.
   if (p.vicinity) {
     if (l === "he") facts.push(`באזור: ${p.vicinity}.`);
     else if (l === "fr") facts.push(`Dans le coin: ${p.vicinity}.`);
     else facts.push(`Area: ${p.vicinity}.`);
   }
 
-  // Only include rating if reviews are not tiny.
   const n = typeof p.userRatingsTotal === "number" ? p.userRatingsTotal : null;
   const r = typeof p.rating === "number" ? p.rating : null;
   if (r !== null && n !== null && n >= 20) {
@@ -298,7 +288,6 @@ function placeFacts({ p, lang, dist }) {
     else facts.push(`Rated ${r} from ${n} reviews.`);
   }
 
-  // Optional: types can help the story model choose the right framing.
   if (Array.isArray(p.types) && p.types.length) {
     const t = p.types.slice(0, 3).join(", ");
     if (l === "he") facts.push(`סוג מקום: ${t}.`);
@@ -342,6 +331,23 @@ async function enrichWithNearbyWikiFacts({ lat, lng, lang, existingFacts = [] })
     : 8;
 
   const ctx = await getNearbyWikiContext({ lat, lon: lng, lang, radiusM, limit });
+
+  if (DEBUG_WIKI_CONTEXT) {
+    log.info("getNearbyWikiContext raw", {
+      lat,
+      lng,
+      lang,
+      radiusM,
+      limit,
+      ok: ctx?.ok === true,
+      factsCount: Array.isArray(ctx?.facts) ? ctx.facts.length : 0,
+      pages: Array.isArray(ctx?.pages)
+        ? ctx.pages.map((p) => ({ title: p.title, pageid: p.pageid, dist: p.dist }))
+        : [],
+      facts: Array.isArray(ctx?.facts) ? ctx.facts : [],
+    });
+  }
+
   if (!ctx.ok || !ctx.facts.length) return existingFacts;
 
   // Keep a small number, and dedupe.
@@ -359,11 +365,9 @@ export async function findBestPoi({ lat, lng, userId, lang = "en" }) {
   const l = normalizeLang(lang);
   const anchor = await reverseGeocode({ lat, lng, lang: l });
 
-  // Try places near you
   const radius = config.poiRadiusMeters;
   const candidates = await googlePlacesNearby({ lat, lng, lang: l, radiusMeters: radius });
 
-  // pick best candidate if any
   let best = null;
   let bestScore = -1;
 
@@ -379,10 +383,8 @@ export async function findBestPoi({ lat, lng, userId, lang = "en" }) {
     const poi = buildPoiFromPlace(best, lat, lng, l);
     poi.anchor = anchor;
 
-    // Nearby wiki context facts around current coordinates
     poi.facts = await enrichWithNearbyWikiFacts({ lat, lng, lang: l, existingFacts: poi.facts });
 
-    // Add street person facts if useful
     if (anchor?.street) {
       const who = streetForPersonLookup(anchor.street);
       if (who) {
@@ -391,6 +393,19 @@ export async function findBestPoi({ lat, lng, userId, lang = "en" }) {
           poi.facts = uniqFacts([...poi.facts, ...pf.facts], 12);
         }
       }
+    }
+
+    if (DEBUG_WIKI_CONTEXT) {
+      log.info("final facts going into story", {
+        lat,
+        lng,
+        lang: l,
+        poiLabel: poi.label,
+        poiSource: poi.source,
+        anchorStreet: poi.anchor?.street || "",
+        anchorArea: poi.anchor?.areaLabel || "",
+        facts: poi.facts,
+      });
     }
 
     return {
@@ -402,7 +417,6 @@ export async function findBestPoi({ lat, lng, userId, lang = "en" }) {
     };
   }
 
-  // No strong POI found - fallback anchor POI
   const label =
     anchor?.areaLabel ||
     (l === "he" ? "האזור הזה" : l === "fr" ? "ce coin" : "this area");
@@ -419,10 +433,13 @@ export async function findBestPoi({ lat, lng, userId, lang = "en" }) {
     anchor,
   };
 
-  // Add nearby wiki context facts even when we only have an anchor
-  anchorPoi.facts = await enrichWithNearbyWikiFacts({ lat, lng, lang: l, existingFacts: anchorPoi.facts });
+  anchorPoi.facts = await enrichWithNearbyWikiFacts({
+    lat,
+    lng,
+    lang: l,
+    existingFacts: anchorPoi.facts,
+  });
 
-  // Try "someone known" from street name and attach as facts
   if (anchor?.street) {
     const who = streetForPersonLookup(anchor.street);
     if (who) {
@@ -432,6 +449,19 @@ export async function findBestPoi({ lat, lng, userId, lang = "en" }) {
         anchorPoi.anchor = { ...anchorPoi.anchor, person: pf.person || null };
       }
     }
+  }
+
+  if (DEBUG_WIKI_CONTEXT) {
+    log.info("final facts going into story", {
+      lat,
+      lng,
+      lang: l,
+      poiLabel: anchorPoi.label,
+      poiSource: anchorPoi.source,
+      anchorStreet: anchorPoi.anchor?.street || "",
+      anchorArea: anchorPoi.anchor?.areaLabel || "",
+      facts: anchorPoi.facts,
+    });
   }
 
   return {
