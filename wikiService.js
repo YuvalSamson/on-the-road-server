@@ -3,8 +3,8 @@
  *
  * IMPORTANT:
  * - No SPARQL.
- * - Never throws on Wikidata errors. If Wikidata fails, returns ok:false and empty facts.
- * - Produces small, neutral person facts ONLY when clearly available.
+ * - Never throws on Wikidata/Wikipedia errors. Returns ok:false and empty facts on failure.
+ * - Produces neutral, compact facts only when clearly supported.
  */
 
 import { config } from "./config.js";
@@ -25,8 +25,8 @@ function normalizeLang(lang) {
   return v.slice(0, 5);
 }
 
-function isSensitiveDescription(desc) {
-  const s = String(desc || "").toLowerCase();
+function isSensitiveText(s) {
+  const t = String(s || "").toLowerCase();
   const bad = [
     "politician",
     "politics",
@@ -38,6 +38,7 @@ function isSensitiveDescription(desc) {
     "military",
     "conflict",
     "occupation",
+    "massacre",
     "פוליטיקאי",
     "פוליטיקה",
     "שר",
@@ -47,8 +48,12 @@ function isSensitiveDescription(desc) {
     "צבא",
     "טרור",
     "כיבוש",
+    "טבח",
+    "רצח",
+    "נהרג",
+    "נכבה",
   ];
-  return bad.some((w) => s.includes(w));
+  return bad.some((w) => t.includes(w));
 }
 
 function safeFactLine(s) {
@@ -56,6 +61,7 @@ function safeFactLine(s) {
   if (!t) return "";
   if (/\b1948\b/.test(t)) return "";
   if (/נכבה|מלחמ|כיבוש|טרור|טבח|רצח|נהרג/.test(t)) return "";
+  if (isSensitiveText(t)) return "";
   return t;
 }
 
@@ -95,29 +101,45 @@ function descFor(entity, lang) {
   );
 }
 
-function buildFactStrings({ lang, personLabel, personDesc, bornStr, hasSpouse }) {
+function sitelinkTitle(entity, lang) {
   const l = normalizeLang(lang);
-  const facts = [];
+  const key = `${l}wiki`;
+  return entity?.sitelinks?.[key]?.title || entity?.sitelinks?.enwiki?.title || "";
+}
 
-  if (bornStr) {
-    if (l === "he") facts.push(`${personLabel} נולד/ה ב-${bornStr}.`);
-    else if (l === "fr") facts.push(`${personLabel} est né(e) le ${bornStr}.`);
-    else facts.push(`${personLabel} was born on ${bornStr}.`);
+function firstSentences(text, maxSentences = 2) {
+  const t = normalizeWhitespace(String(text || "")).trim();
+  if (!t) return [];
+  // Naive split that works decently for he/en/fr in intros
+  const parts = t.split(/(?<=[.?!])\s+/);
+  return parts.slice(0, maxSentences).map((x) => x.trim()).filter(Boolean);
+}
+
+function tryNameOriginFromIntro(intro, lang) {
+  const l = normalizeLang(lang);
+  const t = normalizeWhitespace(String(intro || "")).trim();
+  if (!t) return "";
+
+  // Look for explicit name origin patterns.
+  const patterns = l === "he"
+    ? [
+        /נקרא(?:ת)? על שם[^.?!]+[.?!]/,
+        /השם(?:ו)?[^.?!]+משמעות[^.?!]+[.?!]/,
+        /משמעות השם[^.?!]+[.?!]/,
+        /תרגום[^.?!]+[.?!]/,
+      ]
+    : [
+        /named after[^.?!]+[.?!]/i,
+        /the name means[^.?!]+[.?!]/i,
+        /translation of[^.?!]+[.?!]/i,
+      ];
+
+  for (const re of patterns) {
+    const m = t.match(re);
+    if (m && m[0]) return safeFactLine(m[0]);
   }
 
-  if (personDesc) {
-    if (l === "he") facts.push(`${personLabel}: ${safeTrim(personDesc, 120)}.`);
-    else if (l === "fr") facts.push(`${personLabel}: ${safeTrim(personDesc, 120)}.`);
-    else facts.push(`${personLabel}: ${safeTrim(personDesc, 120)}.`);
-  }
-
-  if (hasSpouse) {
-    if (l === "he") facts.push(`פרט אישי קטן: יש תיעוד לחיי זוגיות ב-Wikidata.`);
-    else if (l === "fr") facts.push(`Petit détail perso: une vie de couple est documentée sur Wikidata.`);
-    else facts.push(`Tiny personal detail: a documented spouse/partner exists on Wikidata.`);
-  }
-
-  return facts.map(safeFactLine).filter(Boolean).slice(0, 3);
+  return "";
 }
 
 async function wikidataSearch(name, lang) {
@@ -138,6 +160,54 @@ async function wikidataEntity(qid) {
   const r = await fetchJson(url, { timeoutMs: config.httpTimeoutMs });
   if (!r.ok || !r.json) return null;
   return r.json?.entities?.[qid] || null;
+}
+
+async function wikipediaIntroByTitle(title, lang) {
+  const l = normalizeLang(lang);
+  const url =
+    `https://${encodeURIComponent(l)}.wikipedia.org/w/api.php` +
+    `?action=query&prop=extracts&explaintext=1&exintro=1&format=json&origin=*` +
+    `&titles=${encodeURIComponent(title)}`;
+
+  const r = await fetchJson(url, { timeoutMs: config.httpTimeoutMs });
+  if (!r.ok || !r.json) return "";
+  const pages = r.json?.query?.pages || {};
+  const first = Object.values(pages)[0];
+  return String(first?.extract || "");
+}
+
+function buildPersonFactStrings({ lang, personLabel, personDesc, bornStr, wikiIntro }) {
+  const l = normalizeLang(lang);
+  const facts = [];
+
+  // Keep birth date only if available (high confidence).
+  if (bornStr) {
+    if (l === "he") facts.push(`${personLabel} נולד/ה ב-${bornStr}.`);
+    else if (l === "fr") facts.push(`${personLabel} est né(e) le ${bornStr}.`);
+    else facts.push(`${personLabel} was born on ${bornStr}.`);
+  }
+
+  // Description is often generic, keep it short.
+  if (personDesc) {
+    const d = safeTrim(personDesc, 110);
+    if (d && !isSensitiveText(d)) {
+      facts.push(`${personLabel}: ${d}.`);
+    }
+  }
+
+  // Try one extra sentence from Wikipedia intro if it adds something and is not sensitive.
+  const introSentences = firstSentences(wikiIntro, 2);
+  for (const s of introSentences) {
+    const line = safeFactLine(s);
+    if (!line) continue;
+    // Avoid repeating label/desc sentence if too similar
+    if (personDesc && line.toLowerCase().includes(String(personDesc).toLowerCase().slice(0, 18))) continue;
+    // Keep it compact
+    facts.push(safeTrim(line, 140));
+    break;
+  }
+
+  return facts.map(safeFactLine).filter(Boolean).slice(0, 3);
 }
 
 export async function tryPersonFactsFromName(name, lang = "en") {
@@ -161,7 +231,7 @@ export async function tryPersonFactsFromName(name, lang = "en") {
     let picked = null;
     for (const r of results) {
       const d = r?.description || "";
-      if (isSensitiveDescription(d)) continue;
+      if (isSensitiveText(d)) continue;
       picked = r;
       break;
     }
@@ -183,7 +253,7 @@ export async function tryPersonFactsFromName(name, lang = "en") {
     const personLabel = labelFor(ent, l) || picked.label || n;
     const personDesc = descFor(ent, l) || picked.description || "";
 
-    if (isSensitiveDescription(personDesc)) {
+    if (isSensitiveText(personDesc)) {
       const out = { ok: false, facts: [], person: null };
       cacheSet(cacheKey, out, config.geoCacheTtlMs);
       return out;
@@ -192,27 +262,133 @@ export async function tryPersonFactsFromName(name, lang = "en") {
     const born = getClaim(ent, "P569");
     const bornStr = getTimeString(born);
 
-    const spouse = getClaim(ent, "P26");
-    const hasSpouse = Boolean(spouse);
+    const title = sitelinkTitle(ent, l);
+    const wikiIntro = title ? await wikipediaIntroByTitle(title, l) : "";
 
-    const facts = buildFactStrings({
+    const facts = buildPersonFactStrings({
       lang: l,
       personLabel,
       personDesc,
       bornStr,
-      hasSpouse,
+      wikiIntro,
     });
 
     const out = {
       ok: facts.length > 0,
       facts,
-      person: { qid, label: personLabel, description: personDesc },
+      person: { qid, label: personLabel, description: personDesc, wikipediaTitle: title || "" },
     };
 
     cacheSet(cacheKey, out, config.geoCacheTtlMs);
     return out;
   } catch {
-    // Never fail the request because Wikidata had a bad day
     return { ok: false, facts: [], person: null };
+  }
+}
+
+/**
+ * New: Nearby Wikipedia context facts from coordinates.
+ * - Uses Wikipedia GeoSearch to find nearby pages.
+ * - Pulls intro extracts, then returns compact, neutral facts.
+ * - Tries to extract one "name origin" line if clearly present.
+ *
+ * @param {object} args
+ * @param {number} args.lat
+ * @param {number} args.lon
+ * @param {string} args.lang
+ * @param {number} [args.radiusM=1200]
+ * @param {number} [args.limit=8]
+ * @returns {Promise<{ok:boolean, facts:string[], pages:Array<{title:string, pageid:number, dist:number}>}>}
+ */
+export async function getNearbyWikiContext({ lat, lon, lang = "en", radiusM = 1200, limit = 8 }) {
+  try {
+    const l = normalizeLang(lang);
+
+    const la = Number(lat);
+    const lo = Number(lon);
+    if (!Number.isFinite(la) || !Number.isFinite(lo)) {
+      return { ok: false, facts: [], pages: [] };
+    }
+
+    const cacheKey = `nearbywikictx:${l}:${la.toFixed(5)},${lo.toFixed(5)}:${radiusM}:${limit}`;
+    const cached = cacheGet(cacheKey);
+    if (cached) return cached;
+
+    const geoUrl =
+      `https://${encodeURIComponent(l)}.wikipedia.org/w/api.php` +
+      `?action=query&list=geosearch&format=json&origin=*` +
+      `&gscoord=${encodeURIComponent(`${la}|${lo}`)}` +
+      `&gsradius=${encodeURIComponent(String(radiusM))}` +
+      `&gslimit=${encodeURIComponent(String(Math.max(1, Math.min(20, limit))))}`;
+
+    const geo = await fetchJson(geoUrl, { timeoutMs: config.httpTimeoutMs });
+    const list = Array.isArray(geo?.json?.query?.geosearch) ? geo.json.query.geosearch : [];
+    const pages = list
+      .map((x) => ({
+        title: String(x?.title || ""),
+        pageid: Number(x?.pageid || 0),
+        dist: Number(x?.dist || 0),
+      }))
+      .filter((x) => x.title && Number.isFinite(x.pageid) && x.pageid > 0)
+      .slice(0, limit);
+
+    if (!pages.length) {
+      const out = { ok: false, facts: [], pages: [] };
+      cacheSet(cacheKey, out, config.geoCacheTtlMs);
+      return out;
+    }
+
+    const pageIds = pages.map((p) => p.pageid).join("|");
+    const exUrl =
+      `https://${encodeURIComponent(l)}.wikipedia.org/w/api.php` +
+      `?action=query&prop=extracts&explaintext=1&exintro=1&format=json&origin=*` +
+      `&pageids=${encodeURIComponent(pageIds)}`;
+
+    const ex = await fetchJson(exUrl, { timeoutMs: config.httpTimeoutMs });
+    const map = ex?.json?.query?.pages || {};
+
+    const facts = [];
+    let nameOrigin = "";
+
+    for (const p of pages) {
+      const page = map?.[p.pageid];
+      const intro = String(page?.extract || "");
+      if (!intro) continue;
+      if (isSensitiveText(intro)) continue;
+
+      // Try name origin once
+      if (!nameOrigin) {
+        const maybe = tryNameOriginFromIntro(intro, l);
+        if (maybe) nameOrigin = maybe;
+      }
+
+      // Take first sentence as a nearby context fact
+      const s1 = firstSentences(intro, 1)[0] || "";
+      const line = safeFactLine(s1);
+      if (!line) continue;
+
+      // Keep it short and avoid duplicates
+      const compact = safeTrim(line, 180);
+      if (compact && !facts.some((f) => f.toLowerCase() === compact.toLowerCase())) {
+        facts.push(compact);
+      }
+
+      if (facts.length >= 6) break;
+    }
+
+    // Prefer inserting name origin as a dedicated fact early, if present and clean
+    const finalFacts = [];
+    if (nameOrigin) finalFacts.push(nameOrigin);
+    for (const f of facts) {
+      if (finalFacts.length >= 7) break;
+      if (nameOrigin && f.toLowerCase() === nameOrigin.toLowerCase()) continue;
+      finalFacts.push(f);
+    }
+
+    const out = { ok: finalFacts.length > 0, facts: finalFacts, pages };
+    cacheSet(cacheKey, out, config.geoCacheTtlMs);
+    return out;
+  } catch {
+    return { ok: false, facts: [], pages: [] };
   }
 }
