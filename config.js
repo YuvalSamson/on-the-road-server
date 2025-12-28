@@ -18,6 +18,9 @@ export const config = {
   version: env("APP_VERSION", "btw-facts-only-round50-better-tts-v1"),
   corsAllowOrigins: env("CORS_ALLOW_ORIGINS", "*"),
 
+  // logs-debug-mode
+  debugWikiContext: process.env.DEBUG_WIKI_CONTEXT === "1",  
+
   // OpenAI
   openaiApiKey: env("OPENAI_API_KEY", ""),
   openaiBaseUrl: env("OPENAI_BASE_URL", "https://api.openai.com"),
