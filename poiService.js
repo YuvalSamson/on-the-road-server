@@ -4,12 +4,12 @@
  * Strategy:
  * 1) Reverse geocode (Google first, fallback OSM) to get anchor: street, neighborhood, city.
  * 2) Try Google Places nearby (optional) for a strong POI within radius.
- * 3) Always enrich with nearby Wikipedia context facts (neutral + filtered).
+ * 3) Enrich with nearby Wikipedia context facts ONLY if relevant to a single primary entity.
  * 4) Try to extract "person facts" from street name via Wikidata (safe filtered).
  *
  * Notes:
  * - Avoid low-signal rating facts when reviews are tiny (< 20).
- * - Keep facts compact and actually useful for the story contract.
+ * - Do not add unrelated nearby neighborhood facts (this caused the "mess").
  * - Debug: set DEBUG_WIKI_CONTEXT=1 to log raw wiki context + final facts.
  */
 
@@ -59,8 +59,8 @@ function metersBetween(lat1, lng1, lat2, lng2) {
   return 2 * R * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
 }
 
-// Remove trailing house numbers and noisy prefixes so person lookup is more likely to succeed.
-function streetForPersonLookup(street) {
+// Normalize street to a "name candidate" (remove house numbers, prefixes, etc).
+function normalizeStreetName(street) {
   const s = normalizeWhitespace(String(street || ""));
   if (!s) return "";
 
@@ -70,6 +70,11 @@ function streetForPersonLookup(street) {
   t = t.replace(/\b(street|st\.|st|ave\.|ave|road|rd\.|rd|blvd\.|blvd)\b/gi, "").trim();
 
   return safeTrim(normalizeWhitespace(t), 80);
+}
+
+function streetForPersonLookup(street) {
+  // Same as normalizeStreetName, but keep as separate function in case you later tune heuristics.
+  return normalizeStreetName(street);
 }
 
 function uniqFacts(list, max = 10) {
@@ -85,6 +90,90 @@ function uniqFacts(list, max = 10) {
     if (out.length >= max) break;
   }
   return out;
+}
+
+// Generic POI names returned by Google that are not real names.
+function isGenericPoiName(name, lang) {
+  const n0 = String(name || "").trim();
+  if (!n0) return true;
+  const n = n0.toLowerCase();
+
+  const genericEn = new Set([
+    "park",
+    "restaurant",
+    "cafe",
+    "bar",
+    "museum",
+    "library",
+    "school",
+    "store",
+    "supermarket",
+    "gym",
+    "hotel",
+    "pharmacy",
+    "hospital",
+  ]);
+
+  const genericHe = new Set([
+    "פארק",
+    "מסעדה",
+    "בית קפה",
+    "קפה",
+    "בר",
+    "מוזיאון",
+    "ספרייה",
+    "בית ספר",
+    "חנות",
+    "סופרמרקט",
+    "חדר כושר",
+    "מלון",
+    "בית מרקחת",
+    "בית חולים",
+  ]);
+
+  if (lang === "he" && genericHe.has(n0)) return true;
+  if (genericEn.has(n)) return true;
+
+  // Often too-short names are generic placeholders
+  if (lang !== "he" && n.length <= 4) return true;
+
+  // "Park" sometimes arrives capitalized
+  if (n === "park") return true;
+
+  return false;
+}
+
+// Tokenize for rough relevance matching (Hebrew + mixed).
+function tokenize(s) {
+  return String(s || "")
+    .replace(/[0-9"'״׳.,()\-]/g, " ")
+    .split(/\s+/)
+    .map((x) => x.trim())
+    .filter((x) => x.length >= 3);
+}
+
+// A wiki page title is relevant if it shares a token with primaryName.
+function isTitleRelevantToPrimary(title, primaryName) {
+  const t = String(title || "");
+  const p = String(primaryName || "");
+  if (!t || !p) return false;
+
+  const pTokens = tokenize(p);
+  if (!pTokens.length) return false;
+
+  return pTokens.some((tok) => t.includes(tok) || t.toLowerCase().includes(tok.toLowerCase()));
+}
+
+// A fact is relevant if it includes at least one token from primaryName.
+function isFactRelevantToPrimary(fact, primaryName) {
+  const f = String(fact || "");
+  const p = String(primaryName || "");
+  if (!f || !p) return false;
+
+  const pTokens = tokenize(p);
+  if (!pTokens.length) return false;
+
+  return pTokens.some((tok) => f.includes(tok));
 }
 
 async function reverseGeocodeGoogle({ lat, lng, lang }) {
@@ -288,24 +377,44 @@ function placeFacts({ p, lang, dist }) {
     else facts.push(`Rated ${r} from ${n} reviews.`);
   }
 
-  if (Array.isArray(p.types) && p.types.length) {
-    const t = p.types.slice(0, 3).join(", ");
-    if (l === "he") facts.push(`סוג מקום: ${t}.`);
-    else if (l === "fr") facts.push(`Type: ${t}.`);
-    else facts.push(`Type: ${t}.`);
-  }
+  // Intentionally do NOT add "Type: park, point_of_interest..." - it creates noise and zero value.
 
   return facts;
 }
 
-function buildPoiFromPlace(p, lat, lng, lang) {
+function buildPoiFromPlace(p, lat, lng, lang, anchor) {
   const dist =
     p.location && typeof p.location.lat === "number" && typeof p.location.lng === "number"
       ? Math.round(metersBetween(lat, lng, p.location.lat, p.location.lng))
       : null;
 
   const key = `gplaces:${p.placeId}`;
-  const label = p.name;
+
+  const l = normalizeLang(lang);
+  const anchorStreetName = anchor?.street ? normalizeStreetName(anchor.street) : "";
+  const anchorCity = anchor?.city ? stripCommaSuffix(anchor.city) : "";
+  const anchorArea = anchor?.areaLabel ? stripCommaSuffix(anchor.areaLabel) : "";
+
+  // Primary name: if POI name is generic, fall back to anchor street/city.
+  let label = p.name;
+  const generic = isGenericPoiName(label, l);
+
+  if (generic) {
+    if (l === "he") {
+      if (anchorStreetName && anchorCity) label = `${anchorStreetName} (${anchorCity})`;
+      else if (anchorStreetName) label = anchorStreetName;
+      else if (p.vicinity) label = `פארק ליד ${p.vicinity}`;
+      else label = anchorArea || "פארק בסביבה";
+    } else if (l === "fr") {
+      if (anchorStreetName && anchorCity) label = `${anchorStreetName} (${anchorCity})`;
+      else if (p.vicinity) label = `Parc près de ${p.vicinity}`;
+      else label = anchorArea || "Un parc dans le coin";
+    } else {
+      if (anchorStreetName && anchorCity) label = `${anchorStreetName} (${anchorCity})`;
+      else if (p.vicinity) label = `Park near ${p.vicinity}`;
+      else label = anchorArea || "A nearby park";
+    }
+  }
 
   const facts = placeFacts({ p, lang, dist });
 
@@ -318,11 +427,15 @@ function buildPoiFromPlace(p, lat, lng, lang) {
     imageUrl: null,
     distanceMetersApprox: dist,
     facts,
-    anchor: null,
+    anchor: anchor || null,
+
+    // Extra: keep what we decided is the primary entity label.
+    primaryName: label,
+    poiWasGenericName: generic,
   };
 }
 
-async function enrichWithNearbyWikiFacts({ lat, lng, lang, existingFacts = [] }) {
+async function enrichWithNearbyWikiFacts({ lat, lng, lang, existingFacts = [], primaryName = "" }) {
   const radiusM = Number.isFinite(Number(config.wikiRadiusMeters))
     ? Number(config.wikiRadiusMeters)
     : 1200;
@@ -339,6 +452,7 @@ async function enrichWithNearbyWikiFacts({ lat, lng, lang, existingFacts = [] })
       lang,
       radiusM,
       limit,
+      primaryName,
       ok: ctx?.ok === true,
       factsCount: Array.isArray(ctx?.facts) ? ctx.facts.length : 0,
       pages: Array.isArray(ctx?.pages)
@@ -348,10 +462,34 @@ async function enrichWithNearbyWikiFacts({ lat, lng, lang, existingFacts = [] })
     });
   }
 
-  if (!ctx.ok || !ctx.facts.length) return existingFacts;
+  if (!ctx?.ok) return existingFacts;
 
-  // Keep a small number, and dedupe.
-  return uniqFacts([...existingFacts, ...ctx.facts], 12);
+  const items = Array.isArray(ctx?.items) ? ctx.items : [];
+
+  // 1) Prefer page items whose TITLE matches primaryName tokens.
+  const relevantItems = primaryName
+    ? items.filter((it) => isTitleRelevantToPrimary(it?.title, primaryName))
+    : [];
+
+  // 2) Collect facts from relevant items only.
+  let wikiFacts = [];
+  for (const it of relevantItems) {
+    const fs = Array.isArray(it?.facts) ? it.facts : [];
+    wikiFacts.push(...fs);
+  }
+
+  // 3) Extra guard: facts must also match primaryName by content.
+  if (primaryName) {
+    wikiFacts = wikiFacts.filter((f) => isFactRelevantToPrimary(f, primaryName));
+  }
+
+  // If nothing matched, DO NOT add wiki facts. This prevents the "random neighborhood" mess.
+  if (!wikiFacts.length) return existingFacts;
+
+  // Keep few wiki facts, the strongest ones should already be first.
+  wikiFacts = uniqFacts(wikiFacts, 4);
+
+  return uniqFacts([...existingFacts, ...wikiFacts], 12);
 }
 
 /**
@@ -380,17 +518,25 @@ export async function findBestPoi({ lat, lng, userId, lang = "en" }) {
   }
 
   if (best) {
-    const poi = buildPoiFromPlace(best, lat, lng, l);
-    poi.anchor = anchor;
+    const poi = buildPoiFromPlace(best, lat, lng, l, anchor);
 
-    poi.facts = await enrichWithNearbyWikiFacts({ lat, lng, lang: l, existingFacts: poi.facts });
+    // Enrich with wiki only if it matches our primary entity
+    poi.facts = await enrichWithNearbyWikiFacts({
+      lat,
+      lng,
+      lang: l,
+      existingFacts: poi.facts,
+      primaryName: poi.primaryName || poi.label || "",
+    });
 
+    // Street person facts (only if street looks like a person name)
     if (anchor?.street) {
       const who = streetForPersonLookup(anchor.street);
       if (who) {
         const pf = await tryPersonFactsFromName(who, l);
         if (pf.ok && pf.facts.length) {
           poi.facts = uniqFacts([...poi.facts, ...pf.facts], 12);
+          poi.anchor = { ...poi.anchor, person: pf.person || null };
         }
       }
     }
@@ -402,6 +548,8 @@ export async function findBestPoi({ lat, lng, userId, lang = "en" }) {
         lang: l,
         poiLabel: poi.label,
         poiSource: poi.source,
+        primaryName: poi.primaryName || "",
+        poiWasGenericName: poi.poiWasGenericName === true,
         anchorStreet: poi.anchor?.street || "",
         anchorArea: poi.anchor?.areaLabel || "",
         facts: poi.facts,
@@ -417,20 +565,32 @@ export async function findBestPoi({ lat, lng, userId, lang = "en" }) {
     };
   }
 
+  // No strong POI found - fallback anchor POI
   const label =
     anchor?.areaLabel ||
     (l === "he" ? "האזור הזה" : l === "fr" ? "ce coin" : "this area");
 
+  const anchorStreetName = anchor?.street ? normalizeStreetName(anchor.street) : "";
+  const anchorCity = anchor?.city ? stripCommaSuffix(anchor.city) : "";
+
+  const primaryName =
+    l === "he"
+      ? (anchorStreetName && anchorCity ? `${anchorStreetName} (${anchorCity})` : anchorStreetName || stripCommaSuffix(label))
+      : (anchorStreetName && anchorCity ? `${anchorStreetName} (${anchorCity})` : anchorStreetName || stripCommaSuffix(label));
+
   const anchorPoi = {
     key: `anchor:${lat.toFixed(5)},${lng.toFixed(5)}`,
     source: "anchor",
-    label,
+    label: primaryName || label,
     description: null,
     wikipediaUrl: null,
     imageUrl: null,
     distanceMetersApprox: 0,
     facts: [],
     anchor,
+
+    primaryName: primaryName || label,
+    poiWasGenericName: true,
   };
 
   anchorPoi.facts = await enrichWithNearbyWikiFacts({
@@ -438,6 +598,7 @@ export async function findBestPoi({ lat, lng, userId, lang = "en" }) {
     lng,
     lang: l,
     existingFacts: anchorPoi.facts,
+    primaryName: anchorPoi.primaryName || "",
   });
 
   if (anchor?.street) {
@@ -458,6 +619,8 @@ export async function findBestPoi({ lat, lng, userId, lang = "en" }) {
       lang: l,
       poiLabel: anchorPoi.label,
       poiSource: anchorPoi.source,
+      primaryName: anchorPoi.primaryName || "",
+      poiWasGenericName: true,
       anchorStreet: anchorPoi.anchor?.street || "",
       anchorArea: anchorPoi.anchor?.areaLabel || "",
       facts: anchorPoi.facts,
