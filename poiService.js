@@ -21,6 +21,7 @@ import {
   normalizeWhitespace,
   stripCommaSuffix,
   safeTrim,
+  makeLogger,
 } from "./utils.js";
 import { tryPersonFactsFromName, getNearbyWikiContext } from "./wikiService.js";
 
