@@ -3,8 +3,7 @@
  *
  * Contract-driven micro-stories for BYTHEWAY:
  * - 4-6 sentences, each adds new info.
- * - No generic "bonus knowledge" unless a clear contextual note is provided.
- * - No hype / marketing clichés.
+ * - No "knowledge bonus" unless a clear contextual note is provided.
  * - Use ONLY provided facts for place-specific claims.
  */
 
@@ -44,44 +43,25 @@ function isSensitiveLine(s) {
   return bad.some((re) => re.test(t));
 }
 
-// Removes low-signal rating/review lines when review-count is small.
-// Example patterns we see in facts:
-// - "Rating: 5, reviews: 1"
-// - "דירוג 5 ומספר ביקורות 1"
 function isTinyReviewLine(s) {
   const t = String(s || "");
-  // English-ish
   const m1 = t.match(/reviews?\s*[:=]?\s*(\d{1,4})/i);
-  // Hebrew-ish
   const m2 = t.match(/ביקורות?\s*[:=]?\s*(\d{1,4})/i);
   const n = Number(m1?.[1] || m2?.[1] || NaN);
   if (!Number.isFinite(n)) return false;
   return n < 20;
 }
 
-// Optional contextual note: only if there's a clear link.
-// Keep this very conservative. If in doubt, return "".
 function contextualNote({ lang, poi, facts }) {
   const l = normalizeLang(lang);
   const text = `${poi?.label || ""} ${poi?.anchor?.areaLabel || ""} ${facts.join(" ")}`.toLowerCase();
 
-  // Clear navigation context
   const navHints = ["gps", "navigation", "wayfinding", "waze", "maps", "מפה", "ניווט", "gps", "ווייז", "מפות"];
   const hasNav = navHints.some((k) => text.includes(k));
   if (hasNav) {
     if (l === "he") return "טיפ ניווט קצר: בעיר GPS לפעמים מזייף כמה מטרים, אז עדיף להיצמד לכתובת ולשילוט.";
     if (l === "fr") return "Astuce navigation: en ville, le GPS peut décaler de quelques mètres, fiez-vous aussi à l’adresse et au panneau.";
     return "Navigation tip: in cities, GPS can drift by a few meters, so use the street address and signage too.";
-  }
-
-  // Nature/park context
-  const natureHints = ["park", "trail", "viewpoint", "garden", "forest", "parc", "sentier", "תצפית", "פארק", "שביל", "גן", "יער"];
-  const hasNature = natureHints.some((k) => text.includes(k));
-  if (hasNature) {
-    // Only if it's truly nature-related.
-    if (l === "he") return "אם בא לך רגע שקט: עצירה של 60 שניות בלי מסך עושה פלאים לנוף.";
-    if (l === "fr") return "Si vous voulez une vraie pause: 60 secondes sans écran changent la manière dont on voit le paysage.";
-    return "If you want a real reset: 60 seconds without your screen changes how the view feels.";
   }
 
   return "";
@@ -131,7 +111,7 @@ async function openaiChat({ system, user }) {
 
   const payload = {
     model,
-    temperature: 0.45,
+    temperature: 0.4,
     messages: [
       { role: "system", content: system },
       { role: "user", content: user },
@@ -156,25 +136,16 @@ async function openaiChat({ system, user }) {
   return String(json?.choices?.[0]?.message?.content ?? "");
 }
 
-/**
- * generateStoryText
- * @param {object} args
- * @param {object} args.poi
- * @param {object} args.taste
- * @param {string} args.lang
- * @param {string[]} [args.extraFacts] - optional additional facts, for example from wikiService nearby context
- * @param {boolean} [args.allowContextNote] - default true. If false, never adds contextual note.
- */
 export async function generateStoryText({ poi, taste, lang = "en", extraFacts = [], allowContextNote = true }) {
   const l = normalizeLang(lang);
   const facts = cleanFacts(poi, extraFacts, 12);
 
-  // Minimum: need at least 2 facts to avoid fluff.
   if (facts.length < 2) return fallbackStory({ poi, lang: l });
 
   const humor = Number.isFinite(Number(taste?.humor)) ? Number(taste.humor) : 0.35;
-
   const note = allowContextNote ? contextualNote({ lang: l, poi, facts }) : "";
+
+  const primary = poi?.primaryName || poi?.label || "";
 
   const system = [
     `You write micro-stories for a travel app named BYTHEWAY.`,
@@ -185,6 +156,7 @@ export async function generateStoryText({ poi, taste, lang = "en", extraFacts = 
     `- Use ONLY the provided facts for place-specific claims. Do not invent.`,
     `Story contract (must follow):`,
     `- 4 to 6 sentences total. Plain text, no bullets, no emojis.`,
+    `- Primary entity name is "${primary}". Do not introduce other named places unless the fact explicitly states they are nearby and includes a distance or clear relation.`,
     `- Sentence 1: sharp hook that justifies stopping here (no clichés).`,
     `- Include exactly one concrete, sensory detail (from facts) that paints a picture.`,
     `- If any fact explains the name (meaning / named after), include it in one sentence.`,
@@ -201,6 +173,7 @@ export async function generateStoryText({ poi, taste, lang = "en", extraFacts = 
   const user = [
     `Anchor label: ${poi?.anchor?.areaLabel || ""}`,
     `Place name: ${poi?.label || ""}`,
+    `Primary name: ${primary}`,
     `Facts (use only these for claims):`,
     facts.map((f, i) => `${i + 1}. ${f}`).join("\n"),
     note ? `Contextual note (optional, only if clearly connected): ${note}` : `Contextual note: (none)`,
@@ -212,7 +185,6 @@ export async function generateStoryText({ poi, taste, lang = "en", extraFacts = 
   const trimmed = safeTrim(out, 1400);
   if (!trimmed) throw new HttpError(500, "Empty story text from OpenAI");
 
-  // Guardrail: reject if model sneaks in "bonus" lines when not allowed.
   if (!note && /בונוס|knowledge bonus|bonus savoir/i.test(trimmed)) {
     return safeTrim(trimmed.replace(/(^|\s)(בונוס.*$|knowledge bonus.*$|bonus savoir.*$)/gim, "").trim(), 1400);
   }
