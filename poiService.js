@@ -4,8 +4,12 @@
  * Strategy:
  * 1) Reverse geocode (Google first, fallback OSM) to get anchor: street, neighborhood, city.
  * 2) Try Google Places nearby (optional) for a strong POI within radius.
- * 3) If no strong POI: return an "anchor POI" and still shouldSpeak=true.
+ * 3) Always enrich with nearby Wikipedia context facts (neutral + filtered).
  * 4) Try to extract "person facts" from street name via Wikidata (safe filtered).
+ *
+ * Notes:
+ * - Avoid low-signal rating facts when reviews are tiny (< 20).
+ * - Keep facts compact and actually useful for the story contract.
  */
 
 import { config } from "./config.js";
@@ -16,8 +20,9 @@ import {
   fetchJson,
   normalizeWhitespace,
   stripCommaSuffix,
+  safeTrim,
 } from "./utils.js";
-import { tryPersonFactsFromName } from "./wikiService.js";
+import { tryPersonFactsFromName, getNearbyWikiContext } from "./wikiService.js";
 
 function normalizeLang(lang) {
   const v = String(lang || "en").toLowerCase();
@@ -49,12 +54,44 @@ function metersBetween(lat1, lng1, lat2, lng2) {
   return 2 * R * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
 }
 
+// Remove trailing house numbers and noisy prefixes so person lookup is more likely to succeed.
+function streetForPersonLookup(street) {
+  const s = normalizeWhitespace(String(street || ""));
+  if (!s) return "";
+
+  // Drop comma suffixes and typical labels
+  let t = stripCommaSuffix(s);
+  t = t.replace(/^(רחוב|שדרות|שד'|שד׳|דרך|כביש)\s+/i, "").trim();
+
+  // Remove trailing house number patterns: "בן גוריון 11", "Ben-Gurion St 11"
+  t = t.replace(/\s+\d{1,5}[a-zא-ת]?\s*$/i, "").trim();
+
+  // Remove common short suffixes
+  t = t.replace(/\b(street|st\.|st|ave\.|ave|road|rd\.|rd|blvd\.|blvd)\b/gi, "").trim();
+
+  return safeTrim(normalizeWhitespace(t), 80);
+}
+
+function uniqFacts(list, max = 10) {
+  const out = [];
+  const seen = new Set();
+  for (const x of Array.isArray(list) ? list : []) {
+    const s = normalizeWhitespace(String(x || "")).trim();
+    if (!s) continue;
+    const k = s.toLowerCase();
+    if (seen.has(k)) continue;
+    seen.add(k);
+    out.push(s);
+    if (out.length >= max) break;
+  }
+  return out;
+}
+
 async function reverseGeocodeGoogle({ lat, lng, lang }) {
   const key = googleKey();
   if (!key) return null;
 
   const l = normalizeLang(lang);
-  // Google uses "iw" sometimes, but "he" generally works too. Keep "he".
   const url =
     "https://maps.googleapis.com/maps/api/geocode/json" +
     `?latlng=${encodeURIComponent(`${lat},${lng}`)}` +
@@ -161,7 +198,6 @@ async function googlePlacesNearby({ lat, lng, lang, radiusMeters }) {
 
   const l = normalizeLang(lang);
 
-  // Prefer "interesting" categories for stories
   const includedTypes = [
     "tourist_attraction",
     "museum",
@@ -218,7 +254,6 @@ async function googlePlacesNearby({ lat, lng, lang, radiusMeters }) {
     all.push(...mapped);
   }
 
-  // de-dup by placeId
   const byId = new Map();
   for (const p of all) {
     if (!p.placeId) continue;
@@ -229,14 +264,51 @@ async function googlePlacesNearby({ lat, lng, lang, radiusMeters }) {
 }
 
 function scorePlace(p) {
-  // gentle scoring: rating + popularity
   const r = typeof p.rating === "number" ? p.rating : 0;
   const n = typeof p.userRatingsTotal === "number" ? p.userRatingsTotal : 0;
   const pop = Math.min(1.5, Math.log10(1 + n) / 3.2);
   return r + pop;
 }
 
-function buildPoiFromPlace(p, lat, lng) {
+function placeFacts({ p, lang, dist }) {
+  const l = normalizeLang(lang);
+  const facts = [];
+
+  // Distance is usually useful and safe.
+  if (Number.isFinite(dist) && dist !== null) {
+    if (l === "he") facts.push(`בערך ${dist} מטר מפה.`);
+    else if (l === "fr") facts.push(`À environ ${dist} m d’ici.`);
+    else facts.push(`About ${dist} meters from here.`);
+  }
+
+  // Vicinity gives context without hype.
+  if (p.vicinity) {
+    if (l === "he") facts.push(`באזור: ${p.vicinity}.`);
+    else if (l === "fr") facts.push(`Dans le coin: ${p.vicinity}.`);
+    else facts.push(`Area: ${p.vicinity}.`);
+  }
+
+  // Only include rating if reviews are not tiny.
+  const n = typeof p.userRatingsTotal === "number" ? p.userRatingsTotal : null;
+  const r = typeof p.rating === "number" ? p.rating : null;
+  if (r !== null && n !== null && n >= 20) {
+    if (l === "he") facts.push(`דירוג ${r} על בסיס ${n} ביקורות.`);
+    else if (l === "fr") facts.push(`Note ${r} basée sur ${n} avis.`);
+    else facts.push(`Rated ${r} from ${n} reviews.`);
+  }
+
+  // Optional: types can help the story model choose the right framing.
+  if (Array.isArray(p.types) && p.types.length) {
+    const t = p.types.slice(0, 3).join(", ");
+    if (l === "he") facts.push(`סוג מקום: ${t}.`);
+    else if (l === "fr") facts.push(`Type: ${t}.`);
+    else facts.push(`Type: ${t}.`);
+  }
+
+  return facts;
+}
+
+function buildPoiFromPlace(p, lat, lng, lang) {
   const dist =
     p.location && typeof p.location.lat === "number" && typeof p.location.lng === "number"
       ? Math.round(metersBetween(lat, lng, p.location.lat, p.location.lng))
@@ -245,10 +317,7 @@ function buildPoiFromPlace(p, lat, lng) {
   const key = `gplaces:${p.placeId}`;
   const label = p.name;
 
-  const facts = [];
-  if (p.rating) facts.push(`דירוג: ${p.rating}.`);
-  if (p.userRatingsTotal) facts.push(`מספר ביקורות: ${p.userRatingsTotal}.`);
-  if (p.vicinity) facts.push(`באזור: ${p.vicinity}.`);
+  const facts = placeFacts({ p, lang, dist });
 
   return {
     key,
@@ -261,6 +330,21 @@ function buildPoiFromPlace(p, lat, lng) {
     facts,
     anchor: null,
   };
+}
+
+async function enrichWithNearbyWikiFacts({ lat, lng, lang, existingFacts = [] }) {
+  const radiusM = Number.isFinite(Number(config.wikiRadiusMeters))
+    ? Number(config.wikiRadiusMeters)
+    : 1200;
+  const limit = Number.isFinite(Number(config.wikiContextLimit))
+    ? Number(config.wikiContextLimit)
+    : 8;
+
+  const ctx = await getNearbyWikiContext({ lat, lon: lng, lang, radiusM, limit });
+  if (!ctx.ok || !ctx.facts.length) return existingFacts;
+
+  // Keep a small number, and dedupe.
+  return uniqFacts([...existingFacts, ...ctx.facts], 12);
 }
 
 /**
@@ -291,14 +375,20 @@ export async function findBestPoi({ lat, lng, userId, lang = "en" }) {
   }
 
   if (best) {
-    const poi = buildPoiFromPlace(best, lat, lng);
+    const poi = buildPoiFromPlace(best, lat, lng, l);
     poi.anchor = anchor;
 
-    // Also try to add "street person" facts if useful (optional)
+    // Nearby wiki context facts around current coordinates
+    poi.facts = await enrichWithNearbyWikiFacts({ lat, lng, lang: l, existingFacts: poi.facts });
+
+    // Add street person facts if useful
     if (anchor?.street) {
-      const pf = await tryPersonFactsFromName(stripCommaSuffix(anchor.street), l);
-      if (pf.ok && pf.facts.length) {
-        poi.facts = [...poi.facts, ...pf.facts].slice(0, 8);
+      const who = streetForPersonLookup(anchor.street);
+      if (who) {
+        const pf = await tryPersonFactsFromName(who, l);
+        if (pf.ok && pf.facts.length) {
+          poi.facts = uniqFacts([...poi.facts, ...pf.facts], 12);
+        }
       }
     }
 
@@ -328,16 +418,21 @@ export async function findBestPoi({ lat, lng, userId, lang = "en" }) {
     anchor,
   };
 
+  // Add nearby wiki context facts even when we only have an anchor
+  anchorPoi.facts = await enrichWithNearbyWikiFacts({ lat, lng, lang: l, existingFacts: anchorPoi.facts });
+
   // Try "someone known" from street name and attach as facts
   if (anchor?.street) {
-    const pf = await tryPersonFactsFromName(stripCommaSuffix(anchor.street), l);
-    if (pf.ok && pf.facts.length) {
-      anchorPoi.facts = [...anchorPoi.facts, ...pf.facts].slice(0, 6);
-      anchorPoi.anchor = { ...anchorPoi.anchor, person: pf.person || null };
+    const who = streetForPersonLookup(anchor.street);
+    if (who) {
+      const pf = await tryPersonFactsFromName(who, l);
+      if (pf.ok && pf.facts.length) {
+        anchorPoi.facts = uniqFacts([...anchorPoi.facts, ...pf.facts], 12);
+        anchorPoi.anchor = { ...anchorPoi.anchor, person: pf.person || null };
+      }
     }
   }
 
-  // IMPORTANT: shouldSpeak=true even without POI, because user wants always an enriching story
   return {
     shouldSpeak: true,
     reason: "fallback_anchor",
